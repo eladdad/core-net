@@ -8,8 +8,8 @@
 mod edge_detector;
 mod layout;
 
-pub use edge_detector::*;
-pub use layout::*;
+pub use edge_detector::{EdgeDetectResult, EdgeDetector, EdgeDetectorConfig, EdgeMask};
+pub use layout::{LayoutBuilder, ScreenLayout, ScreenNode};
 
 use crate::protocol::ScreenEdge;
 

@@ -1,0 +1,184 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: corenet
+            asset_name: corenet-linux-x86_64
+          
+          # macOS Intel
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact_name: corenet
+            asset_name: corenet-macos-x86_64
+          
+          # macOS Apple Silicon
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact_name: corenet
+            asset_name: corenet-macos-aarch64
+          
+          # Windows
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: corenet.exe
+            asset_name: corenet-windows-x86_64.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libudev-dev pkg-config
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare artifact (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+          chmod +x ${{ matrix.asset_name }}
+
+      - name: Prepare artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          copy target\${{ matrix.target }}\release\${{ matrix.artifact_name }} ${{ matrix.asset_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          # Move and compress each artifact
+          for dir in artifacts/*/; do
+            artifact=$(basename "$dir")
+            if [[ "$artifact" == *.exe ]]; then
+              # Windows binary - just copy
+              cp "$dir/$artifact" "release/$artifact"
+            else
+              # Unix binary - create tarball
+              cp "$dir/$artifact" "release/"
+              cd release
+              tar -czvf "${artifact}.tar.gz" "$artifact"
+              rm "$artifact"
+              cd ..
+            fi
+          done
+          ls -la release/
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > checksums-sha256.txt
+          cat checksums-sha256.txt
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: CoreNet ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          body: |
+            ## CoreNet ${{ steps.version.outputs.version }}
+            
+            Cross-host I/O device sharing - Share your mouse and keyboard across multiple computers.
+            
+            ### Downloads
+            
+            | Platform | Architecture | Download |
+            |----------|--------------|----------|
+            | Linux | x86_64 | `corenet-linux-x86_64.tar.gz` |
+            | macOS | Intel (x86_64) | `corenet-macos-x86_64.tar.gz` |
+            | macOS | Apple Silicon (ARM64) | `corenet-macos-aarch64.tar.gz` |
+            | Windows | x86_64 | `corenet-windows-x86_64.exe` |
+            
+            ### Installation
+            
+            **Linux/macOS:**
+            ```bash
+            # Download and extract
+            tar -xzf corenet-<platform>-<arch>.tar.gz
+            chmod +x corenet
+            sudo mv corenet /usr/local/bin/
+            ```
+            
+            **Windows:**
+            Download the `.exe` file and run it directly, or add it to your PATH.
+            
+            ### Quick Start
+            
+            ```bash
+            # On the primary machine (with keyboard/mouse)
+            corenet server --name "My Computer"
+            
+            # On secondary machines
+            corenet client --server <primary-ip>
+            ```
+            
+            ### Checksums
+            See `checksums-sha256.txt` for SHA256 checksums of all files.
+            
+          files: |
+            release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

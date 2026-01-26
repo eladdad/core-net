@@ -18,8 +18,11 @@ mod linux;
 mod windows;
 
 // Re-export common types
-pub use events::*;
-pub use traits::*;
+pub use events::{
+    EventTimestamp, InputEvent, KeyboardEvent, KeyboardState, MouseButtonEvent, MouseMoveEvent,
+    MouseScrollEvent, MouseState,
+};
+pub use traits::{InputCapture, InputError, InputInjector, InputResult};
 
 // Re-export platform-specific implementations
 #[cfg(target_os = "macos")]
@@ -35,13 +38,13 @@ pub use windows::{WindowsInputCapture, WindowsInputInjector};
 pub fn platform_name() -> &'static str {
     #[cfg(target_os = "macos")]
     return "macOS";
-    
+
     #[cfg(target_os = "linux")]
     return "Linux";
-    
+
     #[cfg(target_os = "windows")]
     return "Windows";
-    
+
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     return "Unknown";
 }
