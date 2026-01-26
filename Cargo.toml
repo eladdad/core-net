@@ -1,0 +1,77 @@
+[package]
+name = "corenet"
+version = "0.1.0"
+edition = "2021"
+authors = ["CoreNet Contributors"]
+description = "Cross-host I/O device sharing - Software KVM"
+license = "MIT"
+repository = "https://github.com/your-org/corenet"
+keywords = ["kvm", "input", "mouse", "keyboard", "network"]
+categories = ["network-programming", "hardware-support"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Networking
+tokio-tls = "0.3"
+tokio-native-tls = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+toml = "0.8"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# mDNS discovery
+mdns-sd = "0.10"
+
+# Misc
+bytes = "1.5"
+uuid = { version = "1.6", features = ["v4"] }
+async-trait = "0.1"
+dirs = "5.0"
+hostname = "0.3"
+tempfile = "3.9"
+
+# Platform-specific dependencies
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.23"
+core-foundation = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.12"
+uinput = "0.1"
+nix = { version = "0.27", features = ["ioctl", "fs"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+]}
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "corenet"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
