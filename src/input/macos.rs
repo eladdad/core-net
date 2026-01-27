@@ -40,12 +40,11 @@ impl MacOSInputCapture {
 
     /// Check if the process has accessibility permissions
     pub fn has_accessibility_permission() -> bool {
-        unsafe {
-            extern "C" {
-                fn AXIsProcessTrusted() -> bool;
-            }
-            AXIsProcessTrusted()
+        #[link(name = "ApplicationServices", kind = "framework")]
+        extern "C" {
+            fn AXIsProcessTrusted() -> bool;
         }
+        unsafe { AXIsProcessTrusted() }
     }
 
     /// Request accessibility permissions
