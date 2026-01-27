@@ -9,10 +9,8 @@
 #![cfg(target_os = "macos")]
 
 use async_trait::async_trait;
-use core_graphics::display::CGDisplay;
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton, EventField,
-    ScrollEventUnit,
+    CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
@@ -57,19 +55,7 @@ impl MacOSInputCapture {
 
     /// Request accessibility permissions (opens system dialog)
     pub fn request_accessibility_permission() -> bool {
-        // This opens the system preferences dialog
         Self::has_accessibility_permission()
-    }
-
-    fn cg_flags_to_modifiers(flags: CGEventFlags) -> Modifiers {
-        Modifiers {
-            shift: flags.contains(CGEventFlags::CGEventFlagShift),
-            ctrl: flags.contains(CGEventFlags::CGEventFlagControl),
-            alt: flags.contains(CGEventFlags::CGEventFlagAlternate),
-            meta: flags.contains(CGEventFlags::CGEventFlagCommand),
-            caps_lock: flags.contains(CGEventFlags::CGEventFlagAlphaShift),
-            num_lock: flags.contains(CGEventFlags::CGEventFlagNumericPad),
-        }
     }
 }
 
@@ -95,55 +81,62 @@ impl InputCapture for MacOSInputCapture {
 
         let (tx, rx) = mpsc::channel(1024);
         let capturing = self.capturing.clone();
-        let suppressing = self.suppressing.clone();
         let mouse_state = self.mouse_state.clone();
-        let keyboard_state = self.keyboard_state.clone();
 
         capturing.store(true, Ordering::SeqCst);
 
-        // Note: Full CGEventTap implementation requires using the CoreFoundation
-        // run loop which is complex to integrate with async Rust.
-        // For now, we use a polling approach with CGEvent functions.
+        // Use polling approach for mouse position
         std::thread::spawn(move || {
             tracing::info!("macOS input capture started (polling mode)");
 
             let mut last_mouse_pos = (0i32, 0i32);
 
             while capturing.load(Ordering::SeqCst) {
-                // Poll for mouse position changes
-                if let Ok(event) = CGEvent::new(CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok().as_ref()) {
-                    let location = event.location();
-                    let new_x = location.x as i32;
-                    let new_y = location.y as i32;
-
-                    if new_x != last_mouse_pos.0 || new_y != last_mouse_pos.1 {
-                        let dx = new_x - last_mouse_pos.0;
-                        let dy = new_y - last_mouse_pos.1;
-
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as u64;
-
-                        let event = InputEvent::MouseMove(MouseMoveEvent {
-                            timestamp,
-                            x: Some(new_x),
-                            y: Some(new_y),
-                            dx,
-                            dy,
-                        });
-
-                        if let Ok(mut state) = mouse_state.lock() {
-                            state.x = new_x;
-                            state.y = new_y;
-                        }
-
-                        let _ = tx.blocking_send(event);
-                        last_mouse_pos = (new_x, new_y);
+                // Get current mouse location using NSEvent
+                let (new_x, new_y) = unsafe {
+                    extern "C" {
+                        fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+                        fn CGEventGetLocation(event: *const std::ffi::c_void) -> CGPoint;
+                        fn CFRelease(cf: *const std::ffi::c_void);
                     }
+                    
+                    let event = CGEventCreate(std::ptr::null());
+                    if !event.is_null() {
+                        let location = CGEventGetLocation(event);
+                        CFRelease(event);
+                        (location.x as i32, location.y as i32)
+                    } else {
+                        (last_mouse_pos.0, last_mouse_pos.1)
+                    }
+                };
+
+                if new_x != last_mouse_pos.0 || new_y != last_mouse_pos.1 {
+                    let dx = new_x - last_mouse_pos.0;
+                    let dy = new_y - last_mouse_pos.1;
+
+                    let timestamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64;
+
+                    let event = InputEvent::MouseMove(MouseMoveEvent {
+                        timestamp,
+                        x: Some(new_x),
+                        y: Some(new_y),
+                        dx,
+                        dy,
+                    });
+
+                    if let Ok(mut state) = mouse_state.lock() {
+                        state.x = new_x;
+                        state.y = new_y;
+                    }
+
+                    let _ = tx.blocking_send(event);
+                    last_mouse_pos = (new_x, new_y);
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(8)); // ~120Hz polling
+                std::thread::sleep(std::time::Duration::from_millis(8));
             }
 
             tracing::info!("macOS input capture stopped");
@@ -185,15 +178,15 @@ impl InputCapture for MacOSInputCapture {
 /// macOS input injection implementation using CGEvent
 pub struct MacOSInputInjector {
     initialized: bool,
+    event_source: Option<CGEventSource>,
 }
 
 impl MacOSInputInjector {
     pub fn new() -> Self {
-        Self { initialized: false }
-    }
-
-    fn get_event_source(&self) -> Option<CGEventSource> {
-        CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok()
+        Self {
+            initialized: false,
+            event_source: None,
+        }
     }
 }
 
@@ -213,12 +206,14 @@ impl InputInjector for MacOSInputInjector {
             ));
         }
 
+        self.event_source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).ok();
         self.initialized = true;
         tracing::info!("macOS input injector initialized");
         Ok(())
     }
 
     async fn shutdown(&mut self) -> InputResult<()> {
+        self.event_source = None;
         self.initialized = false;
         Ok(())
     }
@@ -229,14 +224,24 @@ impl InputInjector for MacOSInputInjector {
         }
 
         // Get current mouse position
-        if let Ok(current_event) = CGEvent::new(self.get_event_source().as_ref()) {
-            let current = current_event.location();
-            let new_x = current.x + dx as f64;
-            let new_y = current.y + dy as f64;
-            return self.mouse_move_absolute(new_x as i32, new_y as i32).await;
-        }
+        let (cur_x, cur_y) = unsafe {
+            extern "C" {
+                fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+                fn CGEventGetLocation(event: *const std::ffi::c_void) -> CGPoint;
+                fn CFRelease(cf: *const std::ffi::c_void);
+            }
+            
+            let event = CGEventCreate(std::ptr::null());
+            if !event.is_null() {
+                let location = CGEventGetLocation(event);
+                CFRelease(event);
+                (location.x as i32, location.y as i32)
+            } else {
+                (0, 0)
+            }
+        };
 
-        Ok(())
+        self.mouse_move_absolute(cur_x + dx, cur_y + dy).await
     }
 
     async fn mouse_move_absolute(&mut self, x: i32, y: i32) -> InputResult<()> {
@@ -246,13 +251,15 @@ impl InputInjector for MacOSInputInjector {
 
         let point = CGPoint::new(x as f64, y as f64);
 
-        if let Ok(event) = CGEvent::new_mouse_event(
-            self.get_event_source().as_ref(),
-            CGEventType::MouseMoved,
-            point,
-            CGMouseButton::Left,
-        ) {
-            event.post(CGEventTapLocation::HID);
+        if let Some(ref source) = self.event_source {
+            if let Ok(event) = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::MouseMoved,
+                point,
+                CGMouseButton::Left,
+            ) {
+                event.post(CGEventTapLocation::HID);
+            }
         }
 
         Ok(())
@@ -263,11 +270,22 @@ impl InputInjector for MacOSInputInjector {
             return Err(InputError::NotStarted);
         }
 
-        // Get current mouse position for the event
-        let point = if let Ok(current_event) = CGEvent::new(self.get_event_source().as_ref()) {
-            current_event.location()
-        } else {
-            CGPoint::new(0.0, 0.0)
+        // Get current mouse position
+        let point = unsafe {
+            extern "C" {
+                fn CGEventCreate(source: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+                fn CGEventGetLocation(event: *const std::ffi::c_void) -> CGPoint;
+                fn CFRelease(cf: *const std::ffi::c_void);
+            }
+            
+            let event = CGEventCreate(std::ptr::null());
+            if !event.is_null() {
+                let location = CGEventGetLocation(event);
+                CFRelease(event);
+                location
+            } else {
+                CGPoint::new(0.0, 0.0)
+            }
         };
 
         let (event_type, cg_button) = match (button, pressed) {
@@ -283,10 +301,10 @@ impl InputInjector for MacOSInputInjector {
             (MouseButton::Button5, false) => (CGEventType::OtherMouseUp, CGMouseButton::Center),
         };
 
-        if let Ok(event) =
-            CGEvent::new_mouse_event(self.get_event_source().as_ref(), event_type, point, cg_button)
-        {
-            event.post(CGEventTapLocation::HID);
+        if let Some(ref source) = self.event_source {
+            if let Ok(event) = CGEvent::new_mouse_event(source.clone(), event_type, point, cg_button) {
+                event.post(CGEventTapLocation::HID);
+            }
         }
 
         Ok(())
@@ -297,15 +315,33 @@ impl InputInjector for MacOSInputInjector {
             return Err(InputError::NotStarted);
         }
 
-        if let Ok(event) = CGEvent::new_scroll_event(
-            self.get_event_source().as_ref(),
-            ScrollEventUnit::Line,
-            2,
-            dy,
-            dx,
-            0,
-        ) {
-            event.post(CGEventTapLocation::HID);
+        // Use CGEventCreateScrollWheelEvent via FFI since the Rust wrapper may not have it
+        unsafe {
+            extern "C" {
+                fn CGEventCreateScrollWheelEvent(
+                    source: *const std::ffi::c_void,
+                    units: u32,
+                    wheel_count: u32,
+                    wheel1: i32,
+                    wheel2: i32,
+                ) -> *mut std::ffi::c_void;
+                fn CGEventPost(tap: u32, event: *const std::ffi::c_void);
+                fn CFRelease(cf: *const std::ffi::c_void);
+            }
+
+            // kCGScrollEventUnitLine = 1
+            let event = CGEventCreateScrollWheelEvent(
+                std::ptr::null(),
+                1, // line units
+                2, // wheel count
+                dy,
+                dx,
+            );
+
+            if !event.is_null() {
+                CGEventPost(0, event); // kCGHIDEventTap = 0
+                CFRelease(event);
+            }
         }
 
         Ok(())
@@ -318,24 +354,24 @@ impl InputInjector for MacOSInputInjector {
 
         let mac_keycode = hid_to_macos_keycode(keycode);
 
-        if let Ok(event) =
-            CGEvent::new_keyboard_event(self.get_event_source().as_ref(), mac_keycode as u16, true)
-        {
-            let mut flags = CGEventFlags::empty();
-            if modifiers.shift {
-                flags |= CGEventFlags::CGEventFlagShift;
+        if let Some(ref source) = self.event_source {
+            if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), mac_keycode as u16, true) {
+                let mut flags = CGEventFlags::empty();
+                if modifiers.shift {
+                    flags |= CGEventFlags::CGEventFlagShift;
+                }
+                if modifiers.ctrl {
+                    flags |= CGEventFlags::CGEventFlagControl;
+                }
+                if modifiers.alt {
+                    flags |= CGEventFlags::CGEventFlagAlternate;
+                }
+                if modifiers.meta {
+                    flags |= CGEventFlags::CGEventFlagCommand;
+                }
+                event.set_flags(flags);
+                event.post(CGEventTapLocation::HID);
             }
-            if modifiers.ctrl {
-                flags |= CGEventFlags::CGEventFlagControl;
-            }
-            if modifiers.alt {
-                flags |= CGEventFlags::CGEventFlagAlternate;
-            }
-            if modifiers.meta {
-                flags |= CGEventFlags::CGEventFlagCommand;
-            }
-            event.set_flags(flags);
-            event.post(CGEventTapLocation::HID);
         }
 
         Ok(())
@@ -348,24 +384,24 @@ impl InputInjector for MacOSInputInjector {
 
         let mac_keycode = hid_to_macos_keycode(keycode);
 
-        if let Ok(event) =
-            CGEvent::new_keyboard_event(self.get_event_source().as_ref(), mac_keycode as u16, false)
-        {
-            let mut flags = CGEventFlags::empty();
-            if modifiers.shift {
-                flags |= CGEventFlags::CGEventFlagShift;
+        if let Some(ref source) = self.event_source {
+            if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), mac_keycode as u16, false) {
+                let mut flags = CGEventFlags::empty();
+                if modifiers.shift {
+                    flags |= CGEventFlags::CGEventFlagShift;
+                }
+                if modifiers.ctrl {
+                    flags |= CGEventFlags::CGEventFlagControl;
+                }
+                if modifiers.alt {
+                    flags |= CGEventFlags::CGEventFlagAlternate;
+                }
+                if modifiers.meta {
+                    flags |= CGEventFlags::CGEventFlagCommand;
+                }
+                event.set_flags(flags);
+                event.post(CGEventTapLocation::HID);
             }
-            if modifiers.ctrl {
-                flags |= CGEventFlags::CGEventFlagControl;
-            }
-            if modifiers.alt {
-                flags |= CGEventFlags::CGEventFlagAlternate;
-            }
-            if modifiers.meta {
-                flags |= CGEventFlags::CGEventFlagCommand;
-            }
-            event.set_flags(flags);
-            event.post(CGEventTapLocation::HID);
         }
 
         Ok(())
@@ -379,7 +415,7 @@ impl InputInjector for MacOSInputInjector {
         // For simple characters, use keyboard events
         if let Some((keycode, shift)) = char_to_macos_keycode(c) {
             if shift {
-                self.key_down(0xE1, Modifiers::default()).await?; // Left Shift HID
+                self.key_down(0xE1, Modifiers::default()).await?;
             }
             self.key_down(keycode, Modifiers::default()).await?;
             self.key_up(keycode, Modifiers::default()).await?;
