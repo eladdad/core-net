@@ -20,30 +20,6 @@ use super::events::{
 use super::traits::{InputCapture, InputError, InputInjector, InputResult};
 use crate::protocol::{Modifiers, MouseButton};
 
-// Windows API constants
-const RIDEV_INPUTSINK: u32 = 0x00000100;
-const RID_INPUT: u32 = 0x10000003;
-const RIM_TYPEMOUSE: u32 = 0;
-const RIM_TYPEKEYBOARD: u32 = 1;
-
-const MOUSE_MOVE_RELATIVE: u16 = 0x00;
-const RI_MOUSE_LEFT_BUTTON_DOWN: u16 = 0x0001;
-const RI_MOUSE_LEFT_BUTTON_UP: u16 = 0x0002;
-const RI_MOUSE_RIGHT_BUTTON_DOWN: u16 = 0x0004;
-const RI_MOUSE_RIGHT_BUTTON_UP: u16 = 0x0008;
-const RI_MOUSE_MIDDLE_BUTTON_DOWN: u16 = 0x0010;
-const RI_MOUSE_MIDDLE_BUTTON_UP: u16 = 0x0020;
-const RI_MOUSE_BUTTON_4_DOWN: u16 = 0x0040;
-const RI_MOUSE_BUTTON_4_UP: u16 = 0x0080;
-const RI_MOUSE_BUTTON_5_DOWN: u16 = 0x0100;
-const RI_MOUSE_BUTTON_5_UP: u16 = 0x0200;
-const RI_MOUSE_WHEEL: u16 = 0x0400;
-const RI_MOUSE_HWHEEL: u16 = 0x0800;
-
-const RI_KEY_MAKE: u16 = 0;
-const RI_KEY_BREAK: u16 = 1;
-
-const WM_INPUT: u32 = 0x00FF;
 
 /// Windows input capture implementation using Raw Input API
 pub struct WindowsInputCapture {
@@ -94,6 +70,10 @@ impl InputCapture for WindowsInputCapture {
                 use windows::Win32::Foundation::*;
                 use windows::Win32::UI::WindowsAndMessaging::*;
                 use windows::Win32::UI::Input::*;
+                use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+
+                // Windows API constants
+                const RIDEV_INPUTSINK: u32 = 0x00000100;
 
                 // Create a message-only window to receive raw input
                 let class_name = windows::core::w!("CoreNetRawInput");
@@ -141,7 +121,7 @@ impl InputCapture for WindowsInputCapture {
                     },
                 ];
 
-                if !RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32).as_bool() {
+                if !RegisterRawInputDevices(&devices, std::mem::size_of::<RAWINPUTDEVICE>() as u32).is_ok() {
                     tracing::error!("Failed to register raw input devices");
                     DestroyWindow(hwnd);
                     return;
@@ -239,6 +219,29 @@ unsafe extern "system" fn raw_input_wnd_proc(
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::Win32::UI::Input::*;
 
+    const RID_INPUT: u32 = 0x10000003;
+    const RIM_TYPEMOUSE: u32 = 0;
+    const RIM_TYPEKEYBOARD: u32 = 1;
+
+    const MOUSE_MOVE_RELATIVE: u16 = 0x00;
+    const RI_MOUSE_LEFT_BUTTON_DOWN: u16 = 0x0001;
+    const RI_MOUSE_LEFT_BUTTON_UP: u16 = 0x0002;
+    const RI_MOUSE_RIGHT_BUTTON_DOWN: u16 = 0x0004;
+    const RI_MOUSE_RIGHT_BUTTON_UP: u16 = 0x0008;
+    const RI_MOUSE_MIDDLE_BUTTON_DOWN: u16 = 0x0010;
+    const RI_MOUSE_MIDDLE_BUTTON_UP: u16 = 0x0020;
+    const RI_MOUSE_BUTTON_4_DOWN: u16 = 0x0040;
+    const RI_MOUSE_BUTTON_4_UP: u16 = 0x0080;
+    const RI_MOUSE_BUTTON_5_DOWN: u16 = 0x0100;
+    const RI_MOUSE_BUTTON_5_UP: u16 = 0x0200;
+    const RI_MOUSE_WHEEL: u16 = 0x0400;
+    const RI_MOUSE_HWHEEL: u16 = 0x0800;
+
+    const RI_KEY_MAKE: u16 = 0;
+    const RI_KEY_BREAK: u16 = 1;
+
+    const WM_INPUT: u32 = 0x00FF;
+
     if msg == WM_INPUT {
         RAW_INPUT_CONTEXT.with(|ctx| {
             if let Some(ref context) = *ctx.borrow() {
@@ -246,7 +249,7 @@ unsafe extern "system" fn raw_input_wnd_proc(
                 let mut size: u32 = 0;
                 GetRawInputData(
                     HRAWINPUT(lparam.0),
-                    RID_INPUT,
+                    RAW_INPUT_DATA_COMMAND_FLAGS(RID_INPUT),
                     None,
                     &mut size,
                     std::mem::size_of::<RAWINPUTHEADER>() as u32,
@@ -256,7 +259,7 @@ unsafe extern "system" fn raw_input_wnd_proc(
                     let mut buffer = vec![0u8; size as usize];
                     let bytes_copied = GetRawInputData(
                         HRAWINPUT(lparam.0),
-                        RID_INPUT,
+                        RAW_INPUT_DATA_COMMAND_FLAGS(RID_INPUT),
                         Some(buffer.as_mut_ptr() as *mut _),
                         &mut size,
                         std::mem::size_of::<RAWINPUTHEADER>() as u32,
@@ -301,7 +304,7 @@ unsafe extern "system" fn raw_input_wnd_proc(
                                 }
 
                                 // Handle mouse buttons
-                                let button_flags = mouse.Anonymous.usButtonFlags;
+                                let button_flags = mouse.Anonymous.Anonymous.usButtonFlags;
                                 
                                 if button_flags & RI_MOUSE_LEFT_BUTTON_DOWN != 0 {
                                     send_mouse_button(&context.tx, timestamp, MouseButton::Left, true);
@@ -336,7 +339,7 @@ unsafe extern "system" fn raw_input_wnd_proc(
 
                                 // Handle scroll wheel
                                 if button_flags & RI_MOUSE_WHEEL != 0 {
-                                    let delta = (mouse.Anonymous.usButtonData as i16) as i32 / 120;
+                                    let delta = (mouse.Anonymous.Anonymous.usButtonData as i16) as i32 / 120;
                                     let event = InputEvent::MouseScroll(MouseScrollEvent {
                                         timestamp,
                                         dx: 0,
@@ -345,7 +348,7 @@ unsafe extern "system" fn raw_input_wnd_proc(
                                     let _ = context.tx.blocking_send(event);
                                 }
                                 if button_flags & RI_MOUSE_HWHEEL != 0 {
-                                    let delta = (mouse.Anonymous.usButtonData as i16) as i32 / 120;
+                                    let delta = (mouse.Anonymous.Anonymous.usButtonData as i16) as i32 / 120;
                                     let event = InputEvent::MouseScroll(MouseScrollEvent {
                                         timestamp,
                                         dx: delta,
