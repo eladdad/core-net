@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -27,6 +28,7 @@ pub struct WindowsInputCapture {
     suppressing: Arc<AtomicBool>,
     mouse_state: Arc<Mutex<MouseState>>,
     keyboard_state: Arc<Mutex<KeyboardState>>,
+    cursor_tx: Option<std_mpsc::Sender<CursorCmd>>,
 }
 
 impl WindowsInputCapture {
@@ -36,6 +38,7 @@ impl WindowsInputCapture {
             suppressing: Arc::new(AtomicBool::new(false)),
             mouse_state: Arc::new(Mutex::new(MouseState::new())),
             keyboard_state: Arc::new(Mutex::new(KeyboardState::new())),
+            cursor_tx: None,
         }
     }
 
@@ -63,6 +66,7 @@ impl InputCapture for WindowsInputCapture {
         let keyboard_state = self.keyboard_state.clone();
 
         capturing.store(true, Ordering::SeqCst);
+        self.cursor_tx = Some(spawn_cursor_window_thread());
 
         // Spawn a thread for the raw input message loop
         std::thread::spawn(move || {
@@ -135,7 +139,6 @@ impl InputCapture for WindowsInputCapture {
                         tx: tx.clone(),
                         mouse_state: mouse_state.clone(),
                         keyboard_state: keyboard_state.clone(),
-                        capturing: capturing.clone(),
                     });
                 });
 
@@ -173,6 +176,10 @@ impl InputCapture for WindowsInputCapture {
         }
 
         self.capturing.store(false, Ordering::SeqCst);
+        if let Some(tx) = self.cursor_tx.take() {
+            let _ = tx.send(CursorCmd::Show);
+            let _ = tx.send(CursorCmd::Quit);
+        }
         Ok(())
     }
 
@@ -189,7 +196,14 @@ impl InputCapture for WindowsInputCapture {
     }
 
     fn set_suppress(&mut self, suppress: bool) {
-        self.suppressing.store(suppress, Ordering::SeqCst);
+        let was_suppressing = self.suppressing.swap(suppress, Ordering::SeqCst);
+        if was_suppressing == suppress {
+            return;
+        }
+        if let Some(tx) = &self.cursor_tx {
+            let cmd = if suppress { CursorCmd::Hide } else { CursorCmd::Show };
+            let _ = tx.send(cmd);
+        }
     }
 
     fn is_suppressing(&self) -> bool {
@@ -202,7 +216,6 @@ struct RawInputContext {
     tx: mpsc::Sender<InputEvent>,
     mouse_state: Arc<Mutex<MouseState>>,
     keyboard_state: Arc<Mutex<KeyboardState>>,
-    capturing: Arc<AtomicBool>,
 }
 
 thread_local! {
@@ -388,6 +401,7 @@ unsafe extern "system" fn raw_input_wnd_proc(
                         }
                     }
                 }
+
             }
         });
 
@@ -395,6 +409,124 @@ unsafe extern "system" fn raw_input_wnd_proc(
     }
 
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+enum CursorCmd {
+    Hide,
+    Show,
+    Quit,
+}
+
+fn spawn_cursor_window_thread() -> std_mpsc::Sender<CursorCmd> {
+    let (tx, rx) = std_mpsc::channel::<CursorCmd>();
+
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::Foundation::*;
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+
+        let class_name = windows::core::w!("CoreNetCursorOwner");
+
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            lpfnWndProc: Some(cursor_owner_wnd_proc),
+            hInstance: GetModuleHandleW(None).unwrap().into(),
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+
+        RegisterClassExW(&wc);
+
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_TOOLWINDOW.0 | WS_EX_LAYERED.0),
+            class_name,
+            windows::core::w!("CoreNet Cursor Owner"),
+            WINDOW_STYLE(WS_POPUP.0),
+            0,
+            0,
+            100,
+            100,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        SetLayeredWindowAttributes(hwnd, COLORREF(0), 1, LWA_ALPHA);
+        ShowWindow(hwnd, SW_HIDE);
+
+        let mut visible = true;
+
+        loop {
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    return;
+                }
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(CursorCmd::Hide) => {
+                    if visible {
+                        let screen_w = GetSystemMetrics(SM_CXSCREEN);
+                        let screen_h = GetSystemMetrics(SM_CYSCREEN);
+                        SetWindowPos(
+                            hwnd,
+                            HWND_TOPMOST,
+                            0,
+                            0,
+                            screen_w,
+                            screen_h,
+                            SWP_SHOWWINDOW,
+                        );
+                        ShowWindow(hwnd, SW_SHOW);
+                        SetForegroundWindow(hwnd);
+                        // SetFocus(hwnd);
+                        SetCapture(hwnd);
+                        while ShowCursor(false) >= 0 {}
+                        tracing::info!("Cursor hidden");
+                        visible = false;
+                    }
+                }
+                Ok(CursorCmd::Show) => {
+                    if !visible {
+                        ReleaseCapture();
+                        ShowWindow(hwnd, SW_HIDE);
+                        while ShowCursor(true) < 0 {}
+                        tracing::info!("Cursor shown");
+                        visible = true;
+                    }
+                }
+                Ok(CursorCmd::Quit) => break,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        DestroyWindow(hwnd);
+    });
+
+    tx
+}
+
+unsafe extern "system" fn cursor_owner_wnd_proc(
+    hwnd: windows::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    match msg {
+        WM_SETCURSOR => {
+            SetCursor(HCURSOR(0));
+            windows::Win32::Foundation::LRESULT(1)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
 
 fn send_mouse_button(tx: &mpsc::Sender<InputEvent>, timestamp: u64, button: MouseButton, pressed: bool) {

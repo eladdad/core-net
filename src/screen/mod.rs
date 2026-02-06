@@ -22,13 +22,6 @@ pub fn get_screen_dimensions() -> (u32, u32) {
     (2560, 1600) // Default for Retina MacBook Pro
 }
 
-#[cfg(target_os = "linux")]
-pub fn get_screen_dimensions() -> (u32, u32) {
-    // In real implementation:
-    // Use X11 XDisplayWidth/XDisplayHeight or Wayland protocols
-    (1920, 1080)
-}
-
 #[cfg(target_os = "windows")]
 pub fn get_screen_dimensions() -> (u32, u32) {
     // In real implementation:
@@ -36,7 +29,7 @@ pub fn get_screen_dimensions() -> (u32, u32) {
     (1920, 1080)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn get_screen_dimensions() -> (u32, u32) {
     (1920, 1080)
 }

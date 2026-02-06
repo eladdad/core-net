@@ -11,7 +11,7 @@ CoreNet enables you to use a single mouse and keyboard to control multiple compu
 - **Seamless Mouse Transition**: Move cursor across screen boundaries to switch between hosts
 - **Keyboard Sharing**: Type on any connected host using your primary keyboard
 - **Clipboard Sync**: Copy on one machine, paste on another (optional)
-- **Cross-Platform**: Supports macOS, Linux, and Windows
+- **Cross-Platform**: Supports macOS and Windows
 - **Encrypted Communication**: All traffic is encrypted using TLS
 - **Zero Configuration**: Auto-discovery of hosts on the same network using mDNS
 
@@ -47,7 +47,6 @@ Each platform requires different APIs to capture input events:
 | Platform | Mouse/Keyboard Capture | Input Injection |
 |----------|----------------------|-----------------|
 | macOS    | CGEventTap (Quartz Event Services) | CGEventPost |
-| Linux    | libevdev / uinput | uinput virtual device |
 | Windows  | Raw Input API / Low-level hooks | SendInput API |
 
 ### 2. Screen Edge Detection
@@ -94,16 +93,6 @@ Hosts discover each other using mDNS (Bonjour/Avahi):
 ```bash
 # Requires Accessibility permissions (System Preferences > Privacy > Accessibility)
 # No additional dependencies needed - uses native Quartz APIs
-```
-
-**Linux:**
-```bash
-# Install dependencies
-sudo apt install libevdev-dev libudev-dev  # Debian/Ubuntu
-sudo dnf install libevdev-devel systemd-devel  # Fedora
-
-# User must be in 'input' group
-sudo usermod -aG input $USER
 ```
 
 **Windows:**
@@ -166,7 +155,7 @@ position = "center"  # left, center, right
 [neighbors]
 # Define which hosts are adjacent to which screen edges
 left = "Desktop-PC"
-right = "Linux-Workstation"
+right = "Windows-Workstation"
 
 [security]
 require_tls = true
@@ -207,19 +196,6 @@ CFMachPortRef eventTap = CGEventTapCreate(
 );
 ```
 
-#### Linux (evdev/uinput)
-
-```c
-// Open input devices
-int fd = open("/dev/input/event0", O_RDONLY);
-libevdev_new_from_fd(fd, &dev);
-
-// Create virtual input device for injection
-int uinput_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-ioctl(uinput_fd, UI_SET_EVBIT, EV_KEY);
-ioctl(uinput_fd, UI_SET_EVBIT, EV_REL);
-```
-
 #### Windows (Low-level Hooks)
 
 ```c
@@ -254,7 +230,6 @@ SendInput(1, &input, sizeof(INPUT));
 
 - [x] Core protocol design
 - [ ] macOS input capture/injection
-- [ ] Linux input capture/injection  
 - [ ] Windows input capture/injection
 - [ ] Screen edge detection
 - [ ] mDNS discovery

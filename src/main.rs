@@ -154,12 +154,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create platform-specific input capture
-#[cfg(target_os = "linux")]
-fn create_input_capture() -> Box<dyn InputCapture> {
-    Box::new(input::LinuxInputCapture::new())
-}
-
 #[cfg(target_os = "macos")]
 fn create_input_capture() -> Box<dyn InputCapture> {
     Box::new(input::MacOSInputCapture::new())
@@ -170,17 +164,12 @@ fn create_input_capture() -> Box<dyn InputCapture> {
     Box::new(input::WindowsInputCapture::new())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn create_input_capture() -> Box<dyn InputCapture> {
     panic!("Unsupported platform for input capture");
 }
 
 /// Create platform-specific input injector
-#[cfg(target_os = "linux")]
-fn create_input_injector() -> Box<dyn InputInjector> {
-    Box::new(input::LinuxInputInjector::new())
-}
-
 #[cfg(target_os = "macos")]
 fn create_input_injector() -> Box<dyn InputInjector> {
     Box::new(input::MacOSInputInjector::new())
@@ -191,7 +180,7 @@ fn create_input_injector() -> Box<dyn InputInjector> {
     Box::new(input::WindowsInputInjector::new())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn create_input_injector() -> Box<dyn InputInjector> {
     panic!("Unsupported platform for input injection");
 }
@@ -748,25 +737,6 @@ fn print_system_info() {
             println!("  - Status: GRANTED");
         } else {
             println!("  - Status: NOT GRANTED");
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        println!("\nLinux Requirements:");
-        println!("  - User must be in 'input' group: sudo usermod -aG input $USER");
-        println!("  - uinput module must be loaded: sudo modprobe uinput");
-
-        if input::LinuxInputCapture::has_permission() {
-            println!("  - Input device access: OK");
-        } else {
-            println!("  - Input device access: DENIED");
-        }
-
-        if input::LinuxInputInjector::is_uinput_available() {
-            println!("  - uinput available: YES");
-        } else {
-            println!("  - uinput available: NO");
         }
     }
 
