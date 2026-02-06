@@ -22,12 +22,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact_name: corenet
-            asset_name: corenet-linux-x86_64
-          
           # macOS Intel
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -54,12 +48,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Install dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev libudev-dev pkg-config
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -147,14 +135,13 @@ jobs:
             
             | Platform | Architecture | Download |
             |----------|--------------|----------|
-            | Linux | x86_64 | `corenet-linux-x86_64.tar.gz` |
             | macOS | Intel (x86_64) | `corenet-macos-x86_64.tar.gz` |
             | macOS | Apple Silicon (ARM64) | `corenet-macos-aarch64.tar.gz` |
             | Windows | x86_64 | `corenet-windows-x86_64.exe` |
             
             ### Installation
             
-            **Linux/macOS:**
+            **macOS:**
             ```bash
             # Download and extract
             tar -xzf corenet-<platform>-<arch>.tar.gz
