@@ -76,6 +76,7 @@ impl InputCapture for MacOSInputCapture {
         let (tx, rx) = mpsc::channel(1024);
         let capturing = self.capturing.clone();
         let mouse_state = self.mouse_state.clone();
+        let suppressing = self.suppressing.clone();
 
         capturing.store(true, Ordering::SeqCst);
 
@@ -83,34 +84,60 @@ impl InputCapture for MacOSInputCapture {
             tracing::info!("macOS input capture started (polling mode)");
 
             let mut last_mouse_pos = (0i32, 0i32);
+            let mut suppressing_active = false;
+            let (screen_w, screen_h) = get_main_display_size();
+            let center_x = (screen_w / 2).max(0);
+            let center_y = (screen_h / 2).max(0);
 
             while capturing.load(Ordering::SeqCst) {
+                let is_suppressing = suppressing.load(Ordering::SeqCst);
+
+                if is_suppressing && !suppressing_active {
+                    suppressing_active = true;
+                    set_cursor_position(center_x, center_y);
+                    last_mouse_pos = (center_x, center_y);
+                } else if !is_suppressing && suppressing_active {
+                    suppressing_active = false;
+                    last_mouse_pos = get_cursor_position();
+                }
+
                 let (new_x, new_y) = get_cursor_position();
 
                 if new_x != last_mouse_pos.0 || new_y != last_mouse_pos.1 {
-                    let dx = new_x - last_mouse_pos.0;
-                    let dy = new_y - last_mouse_pos.1;
+                    let (dx, dy) = if suppressing_active {
+                        (new_x - center_x, new_y - center_y)
+                    } else {
+                        (new_x - last_mouse_pos.0, new_y - last_mouse_pos.1)
+                    };
 
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_micros() as u64;
+                    if dx != 0 || dy != 0 {
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64;
 
-                    let event = InputEvent::MouseMove(MouseMoveEvent {
-                        timestamp,
-                        x: Some(new_x),
-                        y: Some(new_y),
-                        dx,
-                        dy,
-                    });
+                        let event = InputEvent::MouseMove(MouseMoveEvent {
+                            timestamp,
+                            x: Some(new_x),
+                            y: Some(new_y),
+                            dx,
+                            dy,
+                        });
 
-                    if let Ok(mut state) = mouse_state.lock() {
-                        state.x = new_x;
-                        state.y = new_y;
+                        if let Ok(mut state) = mouse_state.lock() {
+                            state.x = new_x;
+                            state.y = new_y;
+                        }
+
+                        let _ = tx.blocking_send(event);
+
+                        if suppressing_active {
+                            set_cursor_position(center_x, center_y);
+                            last_mouse_pos = (center_x, center_y);
+                        } else {
+                            last_mouse_pos = (new_x, new_y);
+                        }
                     }
-
-                    let _ = tx.blocking_send(event);
-                    last_mouse_pos = (new_x, new_y);
                 }
 
                 std::thread::sleep(std::time::Duration::from_millis(8));
@@ -338,6 +365,32 @@ fn get_cursor_position() -> (i32, i32) {
         } else {
             (0, 0)
         }
+    }
+}
+
+fn set_cursor_position(x: i32, y: i32) {
+    unsafe {
+        extern "C" {
+            fn CGWarpMouseCursorPosition(point: CGPoint);
+        }
+
+        let point = CGPoint::new(x as f64, y as f64);
+        CGWarpMouseCursorPosition(point);
+    }
+}
+
+fn get_main_display_size() -> (i32, i32) {
+    unsafe {
+        extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayPixelsWide(display: u32) -> usize;
+            fn CGDisplayPixelsHigh(display: u32) -> usize;
+        }
+
+        let display = CGMainDisplayID();
+        let w = CGDisplayPixelsWide(display) as i32;
+        let h = CGDisplayPixelsHigh(display) as i32;
+        (w.max(1), h.max(1))
     }
 }
 
