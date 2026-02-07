@@ -264,6 +264,13 @@ async fn run_server(
         }
     };
 
+    // Set up input injector for local cursor repositioning
+    let mut input_injector = create_input_injector();
+    if let Err(e) = input_injector.init().await {
+        tracing::error!("Failed to initialize input injector: {}", e);
+        println!("Warning: Input injection may not work: {}", e);
+    }
+
     // Set up edge detection
     let edge_config = EdgeDetectorConfig {
         edge_margin: config.screen.edge_margin,
@@ -361,6 +368,9 @@ async fn run_server(
                                     screen_info.height,
                                 );
                                 tracing::debug!("Placing cursor at ({}, {})", x, y);
+                                if let Err(e) = input_injector.mouse_move_absolute(x, y).await {
+                                    tracing::warn!("Failed to position cursor on return: {}", e);
+                                }
                             }
                             _ => {}
                         }
@@ -445,6 +455,7 @@ async fn run_server(
     }
 
     input_capture.stop().await?;
+    input_injector.shutdown().await?;
     server.stop().await?;
     tracing::info!("Server stopped");
 
