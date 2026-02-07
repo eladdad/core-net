@@ -383,13 +383,31 @@ fn get_main_display_size() -> (i32, i32) {
     unsafe {
         extern "C" {
             fn CGMainDisplayID() -> u32;
-            fn CGDisplayPixelsWide(display: u32) -> usize;
-            fn CGDisplayPixelsHigh(display: u32) -> usize;
+            fn CGDisplayBounds(display: u32) -> CGRect;
+        }
+
+        #[repr(C)]
+        struct CGPoint {
+            x: f64,
+            y: f64,
+        }
+
+        #[repr(C)]
+        struct CGSize {
+            width: f64,
+            height: f64,
+        }
+
+        #[repr(C)]
+        struct CGRect {
+            origin: CGPoint,
+            size: CGSize,
         }
 
         let display = CGMainDisplayID();
-        let w = CGDisplayPixelsWide(display) as i32;
-        let h = CGDisplayPixelsHigh(display) as i32;
+        let bounds = CGDisplayBounds(display);
+        let w = bounds.size.width as i32;
+        let h = bounds.size.height as i32;
         (w.max(1), h.max(1))
     }
 }

@@ -290,6 +290,7 @@ async fn run_server(
     // Track connected clients and control state
     let mut clients: Vec<(SocketAddr, ScreenInfo)> = Vec::new();
     let mut control_state = ControlState::Local;
+    let mut last_edge: Option<ScreenEdge> = None;
 
     println!("\n========================================");
     println!("  CoreNet Server Running");
@@ -314,6 +315,10 @@ async fn run_server(
                             addr,
                             client_screen.width,
                             client_screen.height
+                        );
+                        tracing::info!(
+                            "Transition edge for {}: Right (default)",
+                            client_screen.host_name
                         );
 
                         // Add to layout (to the right by default)
@@ -393,6 +398,10 @@ async fn run_server(
                                 
                                 match result {
                                     EdgeDetectResult::Transition { edge, position } => {
+                                        if last_edge != Some(edge) {
+                                            tracing::info!("Cursor reached {:?} edge", edge);
+                                            last_edge = Some(edge);
+                                        }
                                         // Check if there's a client on this edge
                                         if !clients.is_empty() {
                                             // For now, just use the first client for right edge
@@ -422,13 +431,24 @@ async fn run_server(
                                         }
                                     }
                                     EdgeDetectResult::Dwelling { edge, remaining_ms } => {
+                                        if last_edge != Some(edge) {
+                                            tracing::info!("Cursor reached {:?} edge", edge);
+                                            last_edge = Some(edge);
+                                        }
                                         tracing::trace!("Dwelling at {:?} edge, {}ms remaining", edge, remaining_ms);
                                     }
-                                    EdgeDetectResult::NotAtEdge => {}
+                                    EdgeDetectResult::NotAtEdge => {
+                                        if last_edge.is_some() {
+                                            last_edge = None;
+                                        }
+                                    }
                                 }
+                            } else if last_edge.is_some() {
+                                last_edge = None;
                             }
                         }
                     }
+                    
                     ControlState::Remote(client_idx) => {
                         // Send input to the remote client
                         if client_idx < clients.len() {
