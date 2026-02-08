@@ -82,7 +82,9 @@ impl InputCapture for MacOSInputCapture {
         capturing.store(true, Ordering::SeqCst);
 
         std::thread::spawn(move || {
-            if !spawn_event_tap_loop(tx, mouse_state, capturing.clone(), suppressing.clone()) {
+            let tap_tx = tx.clone();
+            let tap_mouse_state = mouse_state.clone();
+            if !spawn_event_tap_loop(tap_tx, tap_mouse_state, capturing.clone(), suppressing.clone()) {
                 tracing::warn!("Event tap unavailable, falling back to polling mode");
                 polling_capture_loop(capturing, suppressing, mouse_state, tx);
             }
