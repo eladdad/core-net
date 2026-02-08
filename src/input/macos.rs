@@ -88,6 +88,7 @@ impl InputCapture for MacOSInputCapture {
             let (screen_w, screen_h) = get_main_display_size();
             let center_x = (screen_w / 2).max(0);
             let center_y = (screen_h / 2).max(0);
+            let edge_margin = 8i32;
 
             while capturing.load(Ordering::SeqCst) {
                 let is_suppressing = suppressing.load(Ordering::SeqCst);
@@ -104,11 +105,8 @@ impl InputCapture for MacOSInputCapture {
                 let (new_x, new_y) = get_cursor_position();
 
                 if new_x != last_mouse_pos.0 || new_y != last_mouse_pos.1 {
-                    let (dx, dy) = if suppressing_active {
-                        (new_x - center_x, new_y - center_y)
-                    } else {
-                        (new_x - last_mouse_pos.0, new_y - last_mouse_pos.1)
-                    };
+                    let dx = new_x - last_mouse_pos.0;
+                    let dy = new_y - last_mouse_pos.1;
 
                     if dx != 0 || dy != 0 {
                         let timestamp = std::time::SystemTime::now()
@@ -130,13 +128,22 @@ impl InputCapture for MacOSInputCapture {
                         }
 
                         let _ = tx.blocking_send(event);
+                    }
 
-                        if suppressing_active {
+                    if suppressing_active {
+                        let near_edge = new_x <= edge_margin
+                            || new_x >= (screen_w - 1 - edge_margin)
+                            || new_y <= edge_margin
+                            || new_y >= (screen_h - 1 - edge_margin);
+
+                        if near_edge {
                             set_cursor_position(center_x, center_y);
                             last_mouse_pos = (center_x, center_y);
                         } else {
                             last_mouse_pos = (new_x, new_y);
                         }
+                    } else {
+                        last_mouse_pos = (new_x, new_y);
                     }
                 }
 
