@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use std::os::raw::{c_int, c_longlong, c_uint, c_ulonglong, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -81,76 +82,10 @@ impl InputCapture for MacOSInputCapture {
         capturing.store(true, Ordering::SeqCst);
 
         std::thread::spawn(move || {
-            tracing::info!("macOS input capture started (polling mode)");
-
-            let mut last_mouse_pos = (0i32, 0i32);
-            let mut suppressing_active = false;
-            let (screen_w, screen_h) = get_main_display_size();
-            let center_x = (screen_w / 2).max(0);
-            let center_y = (screen_h / 2).max(0);
-            let edge_margin = 8i32;
-
-            while capturing.load(Ordering::SeqCst) {
-                let is_suppressing = suppressing.load(Ordering::SeqCst);
-
-                if is_suppressing && !suppressing_active {
-                    suppressing_active = true;
-                    set_cursor_position(center_x, center_y);
-                    last_mouse_pos = (center_x, center_y);
-                } else if !is_suppressing && suppressing_active {
-                    suppressing_active = false;
-                    last_mouse_pos = get_cursor_position();
-                }
-
-                let (new_x, new_y) = get_cursor_position();
-
-                if new_x != last_mouse_pos.0 || new_y != last_mouse_pos.1 {
-                    let dx = new_x - last_mouse_pos.0;
-                    let dy = new_y - last_mouse_pos.1;
-
-                    if dx != 0 || dy != 0 {
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as u64;
-
-                        let event = InputEvent::MouseMove(MouseMoveEvent {
-                            timestamp,
-                            x: Some(new_x),
-                            y: Some(new_y),
-                            dx,
-                            dy,
-                        });
-
-                        if let Ok(mut state) = mouse_state.lock() {
-                            state.x = new_x;
-                            state.y = new_y;
-                        }
-
-                        let _ = tx.blocking_send(event);
-                    }
-
-                    if suppressing_active {
-                        let near_edge = new_x <= edge_margin
-                            || new_x >= (screen_w - 1 - edge_margin)
-                            || new_y <= edge_margin
-                            || new_y >= (screen_h - 1 - edge_margin);
-
-                        if near_edge {
-                            set_cursor_position(center_x, center_y);
-                            last_mouse_pos = (center_x, center_y);
-                        } else {
-                            last_mouse_pos = (new_x, new_y);
-                        }
-                    } else {
-                        last_mouse_pos = (new_x, new_y);
-                    }
-                }
-
-                std::thread::sleep(std::time::Duration::from_millis(8));
+            if !spawn_event_tap_loop(tx, mouse_state, capturing.clone(), suppressing.clone()) {
+                tracing::warn!("Event tap unavailable, falling back to polling mode");
+                polling_capture_loop(capturing, suppressing, mouse_state, tx);
             }
-
-            tracing::info!("macOS input capture stopped");
         });
 
         Ok(rx)
@@ -375,17 +310,6 @@ fn get_cursor_position() -> (i32, i32) {
     }
 }
 
-fn set_cursor_position(x: i32, y: i32) {
-    unsafe {
-        extern "C" {
-            fn CGWarpMouseCursorPosition(point: CGPoint);
-        }
-
-        let point = CGPoint::new(x as f64, y as f64);
-        CGWarpMouseCursorPosition(point);
-    }
-}
-
 fn get_main_display_size() -> (i32, i32) {
     unsafe {
         extern "C" {
@@ -416,6 +340,237 @@ fn get_main_display_size() -> (i32, i32) {
         let w = bounds.size.width as i32;
         let h = bounds.size.height as i32;
         (w.max(1), h.max(1))
+    }
+}
+
+fn polling_capture_loop(
+    capturing: Arc<AtomicBool>,
+    suppressing: Arc<AtomicBool>,
+    mouse_state: Arc<Mutex<MouseState>>,
+    tx: mpsc::Sender<InputEvent>,
+) {
+    tracing::info!("macOS input capture started (polling mode)");
+
+    let mut last_mouse_pos = (0i32, 0i32);
+    let mut suppressing_active = false;
+    let (screen_w, screen_h) = get_main_display_size();
+    let center_x = (screen_w / 2).max(0);
+    let center_y = (screen_h / 2).max(0);
+    let edge_margin = 8i32;
+
+    while capturing.load(Ordering::SeqCst) {
+        let is_suppressing = suppressing.load(Ordering::SeqCst);
+
+        if is_suppressing && !suppressing_active {
+            suppressing_active = true;
+            last_mouse_pos = (center_x, center_y);
+        } else if !is_suppressing && suppressing_active {
+            suppressing_active = false;
+            last_mouse_pos = get_cursor_position();
+        }
+
+        let (new_x, new_y) = get_cursor_position();
+
+        if new_x != last_mouse_pos.0 || new_y != last_mouse_pos.1 {
+            let dx = new_x - last_mouse_pos.0;
+            let dy = new_y - last_mouse_pos.1;
+
+            if dx != 0 || dy != 0 {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as u64;
+
+                let event = InputEvent::MouseMove(MouseMoveEvent {
+                    timestamp,
+                    x: Some(new_x),
+                    y: Some(new_y),
+                    dx,
+                    dy,
+                });
+
+                if let Ok(mut state) = mouse_state.lock() {
+                    state.x = new_x;
+                    state.y = new_y;
+                }
+
+                let _ = tx.blocking_send(event);
+            }
+
+            if suppressing_active {
+                let near_edge = new_x <= edge_margin
+                    || new_x >= (screen_w - 1 - edge_margin)
+                    || new_y <= edge_margin
+                    || new_y >= (screen_h - 1 - edge_margin);
+
+                if near_edge {
+                    last_mouse_pos = (center_x, center_y);
+                } else {
+                    last_mouse_pos = (new_x, new_y);
+                }
+            } else {
+                last_mouse_pos = (new_x, new_y);
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+
+    tracing::info!("macOS input capture stopped");
+}
+
+fn spawn_event_tap_loop(
+    tx: mpsc::Sender<InputEvent>,
+    mouse_state: Arc<Mutex<MouseState>>,
+    capturing: Arc<AtomicBool>,
+    _suppressing: Arc<AtomicBool>,
+) -> bool {
+    unsafe {
+        type CGEventTapProxy = *mut c_void;
+        type CGEventRef = *mut c_void;
+        type CFMachPortRef = *mut c_void;
+        type CFRunLoopSourceRef = *mut c_void;
+        type CFRunLoopRef = *mut c_void;
+        type CGEventType = c_uint;
+        type CGEventMask = c_ulonglong;
+
+        extern "C" {
+            fn CGEventTapCreate(
+                tap: c_uint,
+                place: c_uint,
+                options: c_uint,
+                events_of_interest: CGEventMask,
+                callback: extern "C" fn(CGEventTapProxy, CGEventType, CGEventRef, *mut c_void) -> CGEventRef,
+                user_info: *mut c_void,
+            ) -> CFMachPortRef;
+            fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
+            fn CFMachPortCreateRunLoopSource(
+                allocator: *const c_void,
+                port: CFMachPortRef,
+                order: c_longlong,
+            ) -> CFRunLoopSourceRef;
+            fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: *const c_void);
+            fn CFRunLoopRun();
+            fn CFRunLoopStop(rl: CFRunLoopRef);
+            fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+            fn CFRelease(obj: *const c_void);
+            fn CGEventGetIntegerValueField(event: CGEventRef, field: c_int) -> c_longlong;
+            static kCFRunLoopCommonModes: *const c_void;
+        }
+
+        const KCGHID_EVENT_TAP: c_uint = 0;
+        const KCGHEAD_INSERT_EVENT_TAP: c_uint = 0;
+        const KCGEVENT_TAP_OPTION_LISTEN_ONLY: c_uint = 1;
+
+        const KCGEVENT_MOUSE_MOVED: CGEventType = 5;
+        const KCGEVENT_LEFT_MOUSE_DRAGGED: CGEventType = 6;
+        const KCGEVENT_RIGHT_MOUSE_DRAGGED: CGEventType = 7;
+        const KCGEVENT_OTHER_MOUSE_DRAGGED: CGEventType = 27;
+
+        const KCGMOUSE_EVENT_DELTA_X: c_int = 4;
+        const KCGMOUSE_EVENT_DELTA_Y: c_int = 5;
+
+        #[repr(C)]
+        struct TapContext {
+            tx: mpsc::Sender<InputEvent>,
+            mouse_state: Arc<Mutex<MouseState>>,
+            capturing: Arc<AtomicBool>,
+        }
+
+        extern "C" fn tap_callback(
+            _proxy: CGEventTapProxy,
+            event_type: CGEventType,
+            event: CGEventRef,
+            user_info: *mut c_void,
+        ) -> CGEventRef {
+            unsafe {
+                let context = &*(user_info as *const TapContext);
+                if !context.capturing.load(Ordering::SeqCst) {
+                    CFRunLoopStop(CFRunLoopGetCurrent());
+                    return event;
+                }
+
+                if event_type == KCGEVENT_MOUSE_MOVED
+                    || event_type == KCGEVENT_LEFT_MOUSE_DRAGGED
+                    || event_type == KCGEVENT_RIGHT_MOUSE_DRAGGED
+                    || event_type == KCGEVENT_OTHER_MOUSE_DRAGGED
+                {
+                    let dx = CGEventGetIntegerValueField(event, KCGMOUSE_EVENT_DELTA_X) as i32;
+                    let dy = CGEventGetIntegerValueField(event, KCGMOUSE_EVENT_DELTA_Y) as i32;
+
+                    if dx != 0 || dy != 0 {
+                        let (x, y) = get_cursor_position();
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64;
+
+                        let event = InputEvent::MouseMove(MouseMoveEvent {
+                            timestamp,
+                            x: Some(x),
+                            y: Some(y),
+                            dx,
+                            dy,
+                        });
+
+                        if let Ok(mut state) = context.mouse_state.lock() {
+                            state.x = x;
+                            state.y = y;
+                        }
+
+                        let _ = context.tx.blocking_send(event);
+                    }
+                }
+
+                event
+            }
+        }
+
+        let mask = (1u64 << KCGEVENT_MOUSE_MOVED)
+            | (1u64 << KCGEVENT_LEFT_MOUSE_DRAGGED)
+            | (1u64 << KCGEVENT_RIGHT_MOUSE_DRAGGED)
+            | (1u64 << KCGEVENT_OTHER_MOUSE_DRAGGED);
+
+        let context = Box::new(TapContext {
+            tx,
+            mouse_state,
+            capturing,
+        });
+        let context_ptr = Box::into_raw(context) as *mut c_void;
+
+        let tap = CGEventTapCreate(
+            KCGHID_EVENT_TAP,
+            KCGHEAD_INSERT_EVENT_TAP,
+            KCGEVENT_TAP_OPTION_LISTEN_ONLY,
+            mask,
+            tap_callback,
+            context_ptr,
+        );
+
+        if tap.is_null() {
+            let _ = Box::from_raw(context_ptr as *mut TapContext);
+            return false;
+        }
+
+        let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
+        if source.is_null() {
+            CFRelease(tap);
+            let _ = Box::from_raw(context_ptr as *mut TapContext);
+            return false;
+        }
+
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+        CGEventTapEnable(tap, true);
+
+        tracing::info!("macOS input capture started (CGEventTap)");
+        CFRunLoopRun();
+
+        CFRelease(source);
+        CFRelease(tap);
+        let _ = Box::from_raw(context_ptr as *mut TapContext);
+
+        tracing::info!("macOS input capture stopped (CGEventTap)");
+        true
     }
 }
 
