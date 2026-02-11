@@ -464,7 +464,7 @@ fn spawn_event_tap_loop(
     tx: mpsc::Sender<InputEvent>,
     mouse_state: Arc<Mutex<MouseState>>,
     capturing: Arc<AtomicBool>,
-    _suppressing: Arc<AtomicBool>,
+    suppressing: Arc<AtomicBool>,
 ) -> bool {
     unsafe {
         type CGEventTapProxy = *mut c_void;
@@ -501,7 +501,7 @@ fn spawn_event_tap_loop(
 
         const KCGHID_EVENT_TAP: c_uint = 0;
         const KCGHEAD_INSERT_EVENT_TAP: c_uint = 0;
-        const KCGEVENT_TAP_OPTION_LISTEN_ONLY: c_uint = 1;
+        const KCGEVENT_TAP_OPTION_DEFAULT: c_uint = 0;
 
         const KCGEVENT_MOUSE_MOVED: CGEventType = 5;
         const KCGEVENT_LEFT_MOUSE_DRAGGED: CGEventType = 6;
@@ -516,6 +516,7 @@ fn spawn_event_tap_loop(
             tx: mpsc::Sender<InputEvent>,
             mouse_state: Arc<Mutex<MouseState>>,
             capturing: Arc<AtomicBool>,
+            suppressing: Arc<AtomicBool>,
         }
 
         extern "C" fn tap_callback(
@@ -530,6 +531,8 @@ fn spawn_event_tap_loop(
                     CFRunLoopStop(CFRunLoopGetCurrent());
                     return event;
                 }
+
+                let suppress_local = context.suppressing.load(Ordering::SeqCst);
 
                 if event_type == KCGEVENT_MOUSE_MOVED
                     || event_type == KCGEVENT_LEFT_MOUSE_DRAGGED
@@ -561,6 +564,10 @@ fn spawn_event_tap_loop(
 
                         let _ = context.tx.blocking_send(event);
                     }
+
+                    if suppress_local {
+                        return std::ptr::null_mut();
+                    }
                 }
 
                 event
@@ -576,13 +583,14 @@ fn spawn_event_tap_loop(
             tx,
             mouse_state,
             capturing,
+            suppressing,
         });
         let context_ptr = Box::into_raw(context) as *mut c_void;
 
         let tap = CGEventTapCreate(
             KCGHID_EVENT_TAP,
             KCGHEAD_INSERT_EVENT_TAP,
-            KCGEVENT_TAP_OPTION_LISTEN_ONLY,
+            KCGEVENT_TAP_OPTION_DEFAULT,
             mask,
             tap_callback,
             context_ptr,
