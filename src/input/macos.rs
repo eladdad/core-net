@@ -330,32 +330,32 @@ fn set_cursor_suppression(suppress: bool) {
         }
 
         let (x, y) = get_cursor_position();
-        let display = CGMainDisplayID();
+        let main_display_id = CGMainDisplayID();
         let cursor_display = display_for_cursor_point(x, y);
 
         if suppress {
             let assoc_rc = CGAssociateMouseAndMouseCursorPosition(false);
-            let hide_rc = CGDisplayHideCursor(display);
+            let hide_rc = CGDisplayHideCursor(main_display_id);
             tracing::info!(
-                "cursor suppress ON: assoc_rc={}, hide_rc={}, main_display={}, cursor_display={:?}, cursor=({}, {})",
-                assoc_rc,
-                hide_rc,
-                display,
-                cursor_display,
-                x,
-                y
+                assoc_rc = assoc_rc,
+                hide_rc = hide_rc,
+                main_display = main_display_id,
+                cursor_display = ?cursor_display,
+                cursor_x = x,
+                cursor_y = y,
+                "cursor suppress ON"
             );
         } else {
             let assoc_rc = CGAssociateMouseAndMouseCursorPosition(true);
-            let show_rc = CGDisplayShowCursor(display);
+            let show_rc = CGDisplayShowCursor(main_display_id);
             tracing::info!(
-                "cursor suppress OFF: assoc_rc={}, show_rc={}, main_display={}, cursor_display={:?}, cursor=({}, {})",
-                assoc_rc,
-                show_rc,
-                display,
-                cursor_display,
-                x,
-                y
+                assoc_rc = assoc_rc,
+                show_rc = show_rc,
+                main_display = main_display_id,
+                cursor_display = ?cursor_display,
+                cursor_x = x,
+                cursor_y = y,
+                "cursor suppress OFF"
             );
         }
     }
