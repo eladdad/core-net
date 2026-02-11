@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use std::cmp::max;
 use std::os::raw::{c_int, c_longlong, c_uint, c_ulonglong, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -78,15 +79,53 @@ impl InputCapture for MacOSInputCapture {
         let capturing = self.capturing.clone();
         let mouse_state = self.mouse_state.clone();
         let suppressing = self.suppressing.clone();
+        let synthetic_ignore_until_us = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         capturing.store(true, Ordering::SeqCst);
+
+        // Keep local cursor parked while suppression is active.
+        {
+            let parking_capturing = capturing.clone();
+            let parking_suppressing = suppressing.clone();
+            let parking_ignore = synthetic_ignore_until_us.clone();
+            std::thread::spawn(move || {
+                let (screen_w, screen_h) = get_main_display_size();
+                let center_x = max(screen_w / 2, 0);
+                let center_y = max(screen_h / 2, 0);
+
+                while parking_capturing.load(Ordering::SeqCst) {
+                    if parking_suppressing.load(Ordering::SeqCst) {
+                        let (x, y) = get_cursor_position();
+                        if (x - center_x).abs() > 1 || (y - center_y).abs() > 1 {
+                            parking_ignore.store(now_micros() + 3_000, Ordering::SeqCst);
+                            warp_cursor_position(center_x, center_y);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(6));
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            });
+        }
 
         std::thread::spawn(move || {
             let tap_tx = tx.clone();
             let tap_mouse_state = mouse_state.clone();
-            if !spawn_event_tap_loop(tap_tx, tap_mouse_state, capturing.clone(), suppressing.clone()) {
+            if !spawn_event_tap_loop(
+                tap_tx,
+                tap_mouse_state,
+                capturing.clone(),
+                suppressing.clone(),
+                synthetic_ignore_until_us.clone(),
+            ) {
                 tracing::warn!("Event tap unavailable, falling back to polling mode");
-                polling_capture_loop(capturing, suppressing, mouse_state, tx);
+                polling_capture_loop(
+                    capturing,
+                    suppressing,
+                    synthetic_ignore_until_us,
+                    mouse_state,
+                    tx,
+                );
             }
         });
 
@@ -418,6 +457,24 @@ fn get_cursor_position() -> (i32, i32) {
     }
 }
 
+fn warp_cursor_position(x: i32, y: i32) {
+    unsafe {
+        extern "C" {
+            fn CGWarpMouseCursorPosition(point: CGPoint) -> i32;
+        }
+
+        let point = CGPoint::new(x as f64, y as f64);
+        let _ = CGWarpMouseCursorPosition(point);
+    }
+}
+
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+}
+
 fn get_main_display_size() -> (i32, i32) {
     unsafe {
         extern "C" {
@@ -454,6 +511,7 @@ fn get_main_display_size() -> (i32, i32) {
 fn polling_capture_loop(
     capturing: Arc<AtomicBool>,
     suppressing: Arc<AtomicBool>,
+    synthetic_ignore_until_us: Arc<std::sync::atomic::AtomicU64>,
     mouse_state: Arc<Mutex<MouseState>>,
     tx: mpsc::Sender<InputEvent>,
 ) {
@@ -484,6 +542,11 @@ fn polling_capture_loop(
             let dy = new_y - last_mouse_pos.1;
 
             if dx != 0 || dy != 0 {
+                if now_micros() <= synthetic_ignore_until_us.load(Ordering::SeqCst) {
+                    last_mouse_pos = (new_x, new_y);
+                    continue;
+                }
+
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -532,6 +595,7 @@ fn spawn_event_tap_loop(
     mouse_state: Arc<Mutex<MouseState>>,
     capturing: Arc<AtomicBool>,
     _suppressing: Arc<AtomicBool>,
+    synthetic_ignore_until_us: Arc<std::sync::atomic::AtomicU64>,
 ) -> bool {
     unsafe {
         type CGEventTapProxy = *mut c_void;
@@ -583,6 +647,7 @@ fn spawn_event_tap_loop(
             tx: mpsc::Sender<InputEvent>,
             mouse_state: Arc<Mutex<MouseState>>,
             capturing: Arc<AtomicBool>,
+            synthetic_ignore_until_us: Arc<std::sync::atomic::AtomicU64>,
         }
 
         extern "C" fn tap_callback(
@@ -607,6 +672,11 @@ fn spawn_event_tap_loop(
                     let dy = CGEventGetIntegerValueField(event, KCGMOUSE_EVENT_DELTA_Y) as i32;
 
                     if dx != 0 || dy != 0 {
+                        if now_micros() <= context.synthetic_ignore_until_us.load(Ordering::SeqCst)
+                        {
+                            return event;
+                        }
+
                         let (x, y) = get_cursor_position();
                         let timestamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -643,6 +713,7 @@ fn spawn_event_tap_loop(
             tx,
             mouse_state,
             capturing,
+            synthetic_ignore_until_us,
         });
         let context_ptr = Box::into_raw(context) as *mut c_void;
 
