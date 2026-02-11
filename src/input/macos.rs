@@ -99,6 +99,9 @@ impl InputCapture for MacOSInputCapture {
         }
 
         self.capturing.store(false, Ordering::SeqCst);
+        if self.suppressing.swap(false, Ordering::SeqCst) {
+            set_cursor_suppression(false);
+        }
         Ok(())
     }
 
@@ -115,11 +118,24 @@ impl InputCapture for MacOSInputCapture {
     }
 
     fn set_suppress(&mut self, suppress: bool) {
-        self.suppressing.store(suppress, Ordering::SeqCst);
+        let was_suppressing = self.suppressing.swap(suppress, Ordering::SeqCst);
+        if was_suppressing == suppress {
+            return;
+        }
+
+        set_cursor_suppression(suppress);
     }
 
     fn is_suppressing(&self) -> bool {
         self.suppressing.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for MacOSInputCapture {
+    fn drop(&mut self) {
+        if self.suppressing.swap(false, Ordering::SeqCst) {
+            set_cursor_suppression(false);
+        }
     }
 }
 
@@ -292,6 +308,29 @@ impl InputInjector for MacOSInputInjector {
 }
 
 // Helper functions
+
+fn set_cursor_suppression(suppress: bool) {
+    unsafe {
+        extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayHideCursor(display: u32) -> i32;
+            fn CGDisplayShowCursor(display: u32) -> i32;
+            fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+        }
+
+        let display = CGMainDisplayID();
+
+        if suppress {
+            let _ = CGAssociateMouseAndMouseCursorPosition(false);
+            let _ = CGDisplayHideCursor(display);
+            tracing::debug!("macOS cursor suppressed while remote control is active");
+        } else {
+            let _ = CGAssociateMouseAndMouseCursorPosition(true);
+            let _ = CGDisplayShowCursor(display);
+            tracing::debug!("macOS cursor suppression disabled");
+        }
+    }
+}
 
 fn get_cursor_position() -> (i32, i32) {
     unsafe {
