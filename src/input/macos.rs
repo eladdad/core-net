@@ -120,9 +120,20 @@ impl InputCapture for MacOSInputCapture {
     fn set_suppress(&mut self, suppress: bool) {
         let was_suppressing = self.suppressing.swap(suppress, Ordering::SeqCst);
         if was_suppressing == suppress {
+            tracing::debug!(
+                "set_suppress no-op (state unchanged): suppress={}, cursor={}",
+                suppress,
+                cursor_diag_summary()
+            );
             return;
         }
 
+        tracing::info!(
+            "set_suppress transition: {} -> {}, cursor={}",
+            was_suppressing,
+            suppress,
+            cursor_diag_summary()
+        );
         set_cursor_suppression(suppress);
     }
 
@@ -318,16 +329,72 @@ fn set_cursor_suppression(suppress: bool) {
             fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
         }
 
+        let (x, y) = get_cursor_position();
         let display = CGMainDisplayID();
+        let cursor_display = display_for_cursor_point(x, y);
 
         if suppress {
-            let _ = CGAssociateMouseAndMouseCursorPosition(false);
-            let _ = CGDisplayHideCursor(display);
-            tracing::debug!("macOS cursor suppressed while remote control is active");
+            let assoc_rc = CGAssociateMouseAndMouseCursorPosition(false);
+            let hide_rc = CGDisplayHideCursor(display);
+            tracing::info!(
+                "cursor suppress ON: assoc_rc={}, hide_rc={}, main_display={}, cursor_display={:?}, cursor=({}, {})",
+                assoc_rc,
+                hide_rc,
+                display,
+                cursor_display,
+                x,
+                y
+            );
         } else {
-            let _ = CGAssociateMouseAndMouseCursorPosition(true);
-            let _ = CGDisplayShowCursor(display);
-            tracing::debug!("macOS cursor suppression disabled");
+            let assoc_rc = CGAssociateMouseAndMouseCursorPosition(true);
+            let show_rc = CGDisplayShowCursor(display);
+            tracing::info!(
+                "cursor suppress OFF: assoc_rc={}, show_rc={}, main_display={}, cursor_display={:?}, cursor=({}, {})",
+                assoc_rc,
+                show_rc,
+                display,
+                cursor_display,
+                x,
+                y
+            );
+        }
+    }
+}
+
+fn cursor_diag_summary() -> String {
+    let (x, y) = get_cursor_position();
+    let main_display = unsafe {
+        extern "C" {
+            fn CGMainDisplayID() -> u32;
+        }
+        CGMainDisplayID()
+    };
+    let cursor_display = display_for_cursor_point(x, y);
+    format!(
+        "pos=({}, {}), main_display={}, cursor_display={:?}",
+        x, y, main_display, cursor_display
+    )
+}
+
+fn display_for_cursor_point(x: i32, y: i32) -> Option<u32> {
+    unsafe {
+        extern "C" {
+            fn CGGetDisplaysWithPoint(
+                point: CGPoint,
+                max_displays: u32,
+                displays: *mut u32,
+                display_count: *mut u32,
+            ) -> i32;
+        }
+
+        let point = CGPoint::new(x as f64, y as f64);
+        let mut display_id = 0u32;
+        let mut display_count = 0u32;
+        let rc = CGGetDisplaysWithPoint(point, 1, &mut display_id, &mut display_count);
+        if rc == 0 && display_count > 0 {
+            Some(display_id)
+        } else {
+            None
         }
     }
 }
