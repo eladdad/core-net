@@ -14,6 +14,7 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use std::os::raw::{c_int, c_longlong, c_uint, c_ulonglong, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -27,6 +28,7 @@ pub struct MacOSInputCapture {
     suppressing: Arc<AtomicBool>,
     mouse_state: Arc<Mutex<MouseState>>,
     keyboard_state: Arc<Mutex<KeyboardState>>,
+    shield_tx: Option<std_mpsc::Sender<ShieldCmd>>,
 }
 
 impl MacOSInputCapture {
@@ -36,6 +38,7 @@ impl MacOSInputCapture {
             suppressing: Arc::new(AtomicBool::new(false)),
             mouse_state: Arc::new(Mutex::new(MouseState::new())),
             keyboard_state: Arc::new(Mutex::new(KeyboardState::new())),
+            shield_tx: None,
         }
     }
 
@@ -80,6 +83,7 @@ impl InputCapture for MacOSInputCapture {
         let suppressing = self.suppressing.clone();
 
         capturing.store(true, Ordering::SeqCst);
+        self.shield_tx = Some(spawn_shield_window_thread());
 
         std::thread::spawn(move || {
             let tap_tx = tx.clone();
@@ -100,7 +104,13 @@ impl InputCapture for MacOSInputCapture {
 
         self.capturing.store(false, Ordering::SeqCst);
         if self.suppressing.swap(false, Ordering::SeqCst) {
+            if let Some(tx) = &self.shield_tx {
+                let _ = tx.send(ShieldCmd::Hide);
+            }
             set_cursor_suppression(false);
+        }
+        if let Some(tx) = self.shield_tx.take() {
+            let _ = tx.send(ShieldCmd::Quit);
         }
         Ok(())
     }
@@ -134,6 +144,10 @@ impl InputCapture for MacOSInputCapture {
             suppress,
             cursor_diag_summary()
         );
+
+        if let Some(tx) = &self.shield_tx {
+            let _ = tx.send(if suppress { ShieldCmd::Show } else { ShieldCmd::Hide });
+        }
         set_cursor_suppression(suppress);
     }
 
@@ -145,7 +159,13 @@ impl InputCapture for MacOSInputCapture {
 impl Drop for MacOSInputCapture {
     fn drop(&mut self) {
         if self.suppressing.swap(false, Ordering::SeqCst) {
+            if let Some(tx) = &self.shield_tx {
+                let _ = tx.send(ShieldCmd::Hide);
+            }
             set_cursor_suppression(false);
+        }
+        if let Some(tx) = self.shield_tx.take() {
+            let _ = tx.send(ShieldCmd::Quit);
         }
     }
 }
@@ -319,6 +339,103 @@ impl InputInjector for MacOSInputInjector {
 }
 
 // Helper functions
+
+enum ShieldCmd {
+    Show,
+    Hide,
+    Quit,
+}
+
+fn spawn_shield_window_thread() -> std_mpsc::Sender<ShieldCmd> {
+    let (tx, rx) = std_mpsc::channel::<ShieldCmd>();
+
+    std::thread::spawn(move || unsafe {
+        use cocoa::appkit::{
+            NSApp, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor,
+            NSEventMask, NSScreen, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+            NSDefaultRunLoopMode, NSScreenSaverWindowLevel,
+        };
+        use cocoa::base::{id, nil, NO, YES};
+        use cocoa::foundation::NSAutoreleasePool;
+
+        let _pool = NSAutoreleasePool::new(nil);
+        let app = NSApplication::sharedApplication(nil);
+        app.setActivationPolicy_(
+            NSApplicationActivationPolicy::NSApplicationActivationPolicyProhibited,
+        );
+
+        let screen = NSScreen::mainScreen(nil);
+        if screen == nil {
+            tracing::warn!("Unable to create macOS shield window: no main screen");
+            return;
+        }
+        let frame = screen.frame();
+        let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
+            frame,
+            NSWindowStyleMask::NSWindowStyleMaskBorderless,
+            NSBackingStoreType::NSBackingStoreBuffered,
+            NO,
+        );
+        if window == nil {
+            tracing::warn!("Unable to create macOS shield window");
+            return;
+        }
+
+        window.setOpaque_(NO);
+        window.setBackgroundColor_(NSColor::clearColor(nil));
+        window.setAlphaValue_(0.01);
+        window.setIgnoresMouseEvents_(NO);
+        window.setLevel_(NSScreenSaverWindowLevel + 1);
+        window.setCollectionBehavior_(
+            NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
+        );
+        window.orderOut_(nil);
+
+        let mut visible = false;
+        loop {
+            let event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+                NSEventMask::NSAnyEventMask.bits(),
+                nil,
+                NSDefaultRunLoopMode,
+                YES,
+            );
+            if event != nil {
+                app.sendEvent_(event);
+            }
+
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(ShieldCmd::Show) => {
+                    if !visible {
+                        let screen = NSScreen::mainScreen(nil);
+                        if screen != nil {
+                            let frame = screen.frame();
+                            window.setFrame_display_(frame, YES);
+                        }
+                        window.makeKeyAndOrderFront_(nil);
+                        window.orderFrontRegardless();
+                        visible = true;
+                        tracing::info!("macOS shield window shown");
+                    }
+                }
+                Ok(ShieldCmd::Hide) => {
+                    if visible {
+                        window.orderOut_(nil);
+                        visible = false;
+                        tracing::info!("macOS shield window hidden");
+                    }
+                }
+                Ok(ShieldCmd::Quit) => break,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        window.orderOut_(nil);
+    });
+
+    tx
+}
 
 fn set_cursor_suppression(suppress: bool) {
     unsafe {
