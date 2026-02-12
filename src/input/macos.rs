@@ -531,7 +531,7 @@ fn spawn_event_tap_loop(
     tx: mpsc::Sender<InputEvent>,
     mouse_state: Arc<Mutex<MouseState>>,
     capturing: Arc<AtomicBool>,
-    suppressing: Arc<AtomicBool>,
+    _suppressing: Arc<AtomicBool>,
 ) -> bool {
     unsafe {
         type CGEventTapProxy = *mut c_void;
@@ -568,18 +568,12 @@ fn spawn_event_tap_loop(
 
         const KCGHID_EVENT_TAP: c_uint = 0;
         const KCGHEAD_INSERT_EVENT_TAP: c_uint = 0;
-        const KCGEVENT_TAP_OPTION_DEFAULT: c_uint = 0;
+        const KCGEVENT_TAP_OPTION_LISTEN_ONLY: c_uint = 1;
 
         const KCGEVENT_MOUSE_MOVED: CGEventType = 5;
         const KCGEVENT_LEFT_MOUSE_DRAGGED: CGEventType = 6;
         const KCGEVENT_RIGHT_MOUSE_DRAGGED: CGEventType = 7;
         const KCGEVENT_OTHER_MOUSE_DRAGGED: CGEventType = 27;
-        const KCGEVENT_LEFT_MOUSE_DOWN: CGEventType = 1;
-        const KCGEVENT_LEFT_MOUSE_UP: CGEventType = 2;
-        const KCGEVENT_RIGHT_MOUSE_DOWN: CGEventType = 3;
-        const KCGEVENT_RIGHT_MOUSE_UP: CGEventType = 4;
-        const KCGEVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
-        const KCGEVENT_OTHER_MOUSE_UP: CGEventType = 26;
 
         const KCGMOUSE_EVENT_DELTA_X: c_int = 4;
         const KCGMOUSE_EVENT_DELTA_Y: c_int = 5;
@@ -589,7 +583,6 @@ fn spawn_event_tap_loop(
             tx: mpsc::Sender<InputEvent>,
             mouse_state: Arc<Mutex<MouseState>>,
             capturing: Arc<AtomicBool>,
-            suppressing: Arc<AtomicBool>,
         }
 
         extern "C" fn tap_callback(
@@ -603,21 +596,6 @@ fn spawn_event_tap_loop(
                 if !context.capturing.load(Ordering::SeqCst) {
                     CFRunLoopStop(CFRunLoopGetCurrent());
                     return event;
-                }
-
-                let is_suppressing = context.suppressing.load(Ordering::SeqCst);
-
-                // When remote side has control, swallow local mouse button presses/releases
-                // to prevent accidental clicks on macOS while cursor is hidden.
-                if is_suppressing
-                    && (event_type == KCGEVENT_LEFT_MOUSE_DOWN
-                        || event_type == KCGEVENT_LEFT_MOUSE_UP
-                        || event_type == KCGEVENT_RIGHT_MOUSE_DOWN
-                        || event_type == KCGEVENT_RIGHT_MOUSE_UP
-                        || event_type == KCGEVENT_OTHER_MOUSE_DOWN
-                        || event_type == KCGEVENT_OTHER_MOUSE_UP)
-                {
-                    return std::ptr::null_mut();
                 }
 
                 if event_type == KCGEVENT_MOUSE_MOVED
@@ -659,26 +637,19 @@ fn spawn_event_tap_loop(
         let mask = (1u64 << KCGEVENT_MOUSE_MOVED)
             | (1u64 << KCGEVENT_LEFT_MOUSE_DRAGGED)
             | (1u64 << KCGEVENT_RIGHT_MOUSE_DRAGGED)
-            | (1u64 << KCGEVENT_OTHER_MOUSE_DRAGGED)
-            | (1u64 << KCGEVENT_LEFT_MOUSE_DOWN)
-            | (1u64 << KCGEVENT_LEFT_MOUSE_UP)
-            | (1u64 << KCGEVENT_RIGHT_MOUSE_DOWN)
-            | (1u64 << KCGEVENT_RIGHT_MOUSE_UP)
-            | (1u64 << KCGEVENT_OTHER_MOUSE_DOWN)
-            | (1u64 << KCGEVENT_OTHER_MOUSE_UP);
+            | (1u64 << KCGEVENT_OTHER_MOUSE_DRAGGED);
 
         let context = Box::new(TapContext {
             tx,
             mouse_state,
             capturing,
-            suppressing,
         });
         let context_ptr = Box::into_raw(context) as *mut c_void;
 
         let tap = CGEventTapCreate(
             KCGHID_EVENT_TAP,
             KCGHEAD_INSERT_EVENT_TAP,
-            KCGEVENT_TAP_OPTION_DEFAULT,
+            KCGEVENT_TAP_OPTION_LISTEN_ONLY,
             mask,
             tap_callback,
             context_ptr,
