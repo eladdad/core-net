@@ -369,10 +369,10 @@ fn spawn_shield_window_thread() -> std_mpsc::Sender<ShieldCmd> {
             tracing::warn!("Unable to create macOS shield window: no main screen");
             return;
         }
-        let frame = screen.frame();
+        let frame = NSScreen::frame(screen);
         let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
             frame,
-            NSWindowStyleMask::NSWindowStyleMaskBorderless,
+            NSWindowStyleMask::NSBorderlessWindowMask,
             NSBackingStoreType::NSBackingStoreBuffered,
             NO,
         );
@@ -409,7 +409,7 @@ fn spawn_shield_window_thread() -> std_mpsc::Sender<ShieldCmd> {
                     if !visible {
                         let screen = NSScreen::mainScreen(nil);
                         if screen != nil {
-                            let frame = screen.frame();
+                            let frame = NSScreen::frame(screen);
                             window.setFrame_display_(frame, YES);
                         }
                         window.makeKeyAndOrderFront_(nil);
