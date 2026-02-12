@@ -353,7 +353,6 @@ fn spawn_shield_window_thread() -> std_mpsc::Sender<ShieldCmd> {
         use cocoa::appkit::{
             NSApp, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor,
             NSEventMask, NSScreen, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
-            NSDefaultRunLoopMode, NSScreenSaverWindowLevel,
         };
         use cocoa::base::{id, nil, NO, YES};
         use cocoa::foundation::NSAutoreleasePool;
@@ -385,7 +384,8 @@ fn spawn_shield_window_thread() -> std_mpsc::Sender<ShieldCmd> {
         window.setBackgroundColor_(NSColor::clearColor(nil));
         window.setAlphaValue_(0.01);
         window.setIgnoresMouseEvents_(NO);
-        window.setLevel_(NSScreenSaverWindowLevel + 1);
+        // Keep the shield above regular app windows.
+        window.setLevel_(1_000_000);
         window.setCollectionBehavior_(
             NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
                 | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
@@ -397,7 +397,7 @@ fn spawn_shield_window_thread() -> std_mpsc::Sender<ShieldCmd> {
             let event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
                 NSEventMask::NSAnyEventMask.bits(),
                 nil,
-                NSDefaultRunLoopMode,
+                nil,
                 YES,
             );
             if event != nil {
