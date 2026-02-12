@@ -14,7 +14,6 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use std::os::raw::{c_int, c_longlong, c_uint, c_ulonglong, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -28,7 +27,6 @@ pub struct MacOSInputCapture {
     suppressing: Arc<AtomicBool>,
     mouse_state: Arc<Mutex<MouseState>>,
     keyboard_state: Arc<Mutex<KeyboardState>>,
-    shield_tx: Option<std_mpsc::Sender<ShieldCmd>>,
 }
 
 impl MacOSInputCapture {
@@ -38,7 +36,6 @@ impl MacOSInputCapture {
             suppressing: Arc::new(AtomicBool::new(false)),
             mouse_state: Arc::new(Mutex::new(MouseState::new())),
             keyboard_state: Arc::new(Mutex::new(KeyboardState::new())),
-            shield_tx: None,
         }
     }
 
@@ -83,7 +80,6 @@ impl InputCapture for MacOSInputCapture {
         let suppressing = self.suppressing.clone();
 
         capturing.store(true, Ordering::SeqCst);
-        self.shield_tx = Some(spawn_shield_window_thread());
 
         std::thread::spawn(move || {
             let tap_tx = tx.clone();
@@ -104,13 +100,7 @@ impl InputCapture for MacOSInputCapture {
 
         self.capturing.store(false, Ordering::SeqCst);
         if self.suppressing.swap(false, Ordering::SeqCst) {
-            if let Some(tx) = &self.shield_tx {
-                let _ = tx.send(ShieldCmd::Hide);
-            }
             set_cursor_suppression(false);
-        }
-        if let Some(tx) = self.shield_tx.take() {
-            let _ = tx.send(ShieldCmd::Quit);
         }
         Ok(())
     }
@@ -144,10 +134,6 @@ impl InputCapture for MacOSInputCapture {
             suppress,
             cursor_diag_summary()
         );
-
-        if let Some(tx) = &self.shield_tx {
-            let _ = tx.send(if suppress { ShieldCmd::Show } else { ShieldCmd::Hide });
-        }
         set_cursor_suppression(suppress);
     }
 
@@ -159,13 +145,7 @@ impl InputCapture for MacOSInputCapture {
 impl Drop for MacOSInputCapture {
     fn drop(&mut self) {
         if self.suppressing.swap(false, Ordering::SeqCst) {
-            if let Some(tx) = &self.shield_tx {
-                let _ = tx.send(ShieldCmd::Hide);
-            }
             set_cursor_suppression(false);
-        }
-        if let Some(tx) = self.shield_tx.take() {
-            let _ = tx.send(ShieldCmd::Quit);
         }
     }
 }
@@ -339,103 +319,6 @@ impl InputInjector for MacOSInputInjector {
 }
 
 // Helper functions
-
-enum ShieldCmd {
-    Show,
-    Hide,
-    Quit,
-}
-
-fn spawn_shield_window_thread() -> std_mpsc::Sender<ShieldCmd> {
-    let (tx, rx) = std_mpsc::channel::<ShieldCmd>();
-
-    std::thread::spawn(move || unsafe {
-        use cocoa::appkit::{
-            NSApp, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor,
-            NSEventMask, NSScreen, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
-        };
-        use cocoa::base::{id, nil, NO, YES};
-        use cocoa::foundation::NSAutoreleasePool;
-
-        let _pool = NSAutoreleasePool::new(nil);
-        let app = NSApplication::sharedApplication(nil);
-        app.setActivationPolicy_(
-            NSApplicationActivationPolicy::NSApplicationActivationPolicyProhibited,
-        );
-
-        let screen = NSScreen::mainScreen(nil);
-        if screen == nil {
-            tracing::warn!("Unable to create macOS shield window: no main screen");
-            return;
-        }
-        let frame = NSScreen::frame(screen);
-        let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
-            frame,
-            NSWindowStyleMask::NSBorderlessWindowMask,
-            NSBackingStoreType::NSBackingStoreBuffered,
-            NO,
-        );
-        if window == nil {
-            tracing::warn!("Unable to create macOS shield window");
-            return;
-        }
-
-        window.setOpaque_(NO);
-        window.setBackgroundColor_(NSColor::clearColor(nil));
-        window.setAlphaValue_(0.01);
-        window.setIgnoresMouseEvents_(NO);
-        // Keep the shield above regular app windows.
-        window.setLevel_(1_000_000);
-        window.setCollectionBehavior_(
-            NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
-                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
-        );
-        window.orderOut_(nil);
-
-        let mut visible = false;
-        loop {
-            let event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
-                NSEventMask::NSAnyEventMask.bits(),
-                nil,
-                nil,
-                YES,
-            );
-            if event != nil {
-                app.sendEvent_(event);
-            }
-
-            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                Ok(ShieldCmd::Show) => {
-                    if !visible {
-                        let screen = NSScreen::mainScreen(nil);
-                        if screen != nil {
-                            let frame = NSScreen::frame(screen);
-                            window.setFrame_display_(frame, YES);
-                        }
-                        window.makeKeyAndOrderFront_(nil);
-                        window.orderFrontRegardless();
-                        visible = true;
-                        tracing::info!("macOS shield window shown");
-                    }
-                }
-                Ok(ShieldCmd::Hide) => {
-                    if visible {
-                        window.orderOut_(nil);
-                        visible = false;
-                        tracing::info!("macOS shield window hidden");
-                    }
-                }
-                Ok(ShieldCmd::Quit) => break,
-                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        window.orderOut_(nil);
-    });
-
-    tx
-}
 
 fn set_cursor_suppression(suppress: bool) {
     unsafe {
@@ -648,7 +531,7 @@ fn spawn_event_tap_loop(
     tx: mpsc::Sender<InputEvent>,
     mouse_state: Arc<Mutex<MouseState>>,
     capturing: Arc<AtomicBool>,
-    _suppressing: Arc<AtomicBool>,
+    suppressing: Arc<AtomicBool>,
 ) -> bool {
     unsafe {
         type CGEventTapProxy = *mut c_void;
@@ -685,12 +568,18 @@ fn spawn_event_tap_loop(
 
         const KCGHID_EVENT_TAP: c_uint = 0;
         const KCGHEAD_INSERT_EVENT_TAP: c_uint = 0;
-        const KCGEVENT_TAP_OPTION_LISTEN_ONLY: c_uint = 1;
+        const KCGEVENT_TAP_OPTION_DEFAULT: c_uint = 0;
 
         const KCGEVENT_MOUSE_MOVED: CGEventType = 5;
         const KCGEVENT_LEFT_MOUSE_DRAGGED: CGEventType = 6;
         const KCGEVENT_RIGHT_MOUSE_DRAGGED: CGEventType = 7;
         const KCGEVENT_OTHER_MOUSE_DRAGGED: CGEventType = 27;
+        const KCGEVENT_LEFT_MOUSE_DOWN: CGEventType = 1;
+        const KCGEVENT_LEFT_MOUSE_UP: CGEventType = 2;
+        const KCGEVENT_RIGHT_MOUSE_DOWN: CGEventType = 3;
+        const KCGEVENT_RIGHT_MOUSE_UP: CGEventType = 4;
+        const KCGEVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
+        const KCGEVENT_OTHER_MOUSE_UP: CGEventType = 26;
 
         const KCGMOUSE_EVENT_DELTA_X: c_int = 4;
         const KCGMOUSE_EVENT_DELTA_Y: c_int = 5;
@@ -700,6 +589,7 @@ fn spawn_event_tap_loop(
             tx: mpsc::Sender<InputEvent>,
             mouse_state: Arc<Mutex<MouseState>>,
             capturing: Arc<AtomicBool>,
+            suppressing: Arc<AtomicBool>,
         }
 
         extern "C" fn tap_callback(
@@ -713,6 +603,21 @@ fn spawn_event_tap_loop(
                 if !context.capturing.load(Ordering::SeqCst) {
                     CFRunLoopStop(CFRunLoopGetCurrent());
                     return event;
+                }
+
+                let is_suppressing = context.suppressing.load(Ordering::SeqCst);
+
+                // When remote side has control, swallow local mouse button presses/releases
+                // to prevent accidental clicks on macOS while cursor is hidden.
+                if is_suppressing
+                    && (event_type == KCGEVENT_LEFT_MOUSE_DOWN
+                        || event_type == KCGEVENT_LEFT_MOUSE_UP
+                        || event_type == KCGEVENT_RIGHT_MOUSE_DOWN
+                        || event_type == KCGEVENT_RIGHT_MOUSE_UP
+                        || event_type == KCGEVENT_OTHER_MOUSE_DOWN
+                        || event_type == KCGEVENT_OTHER_MOUSE_UP)
+                {
+                    return std::ptr::null_mut();
                 }
 
                 if event_type == KCGEVENT_MOUSE_MOVED
@@ -754,19 +659,26 @@ fn spawn_event_tap_loop(
         let mask = (1u64 << KCGEVENT_MOUSE_MOVED)
             | (1u64 << KCGEVENT_LEFT_MOUSE_DRAGGED)
             | (1u64 << KCGEVENT_RIGHT_MOUSE_DRAGGED)
-            | (1u64 << KCGEVENT_OTHER_MOUSE_DRAGGED);
+            | (1u64 << KCGEVENT_OTHER_MOUSE_DRAGGED)
+            | (1u64 << KCGEVENT_LEFT_MOUSE_DOWN)
+            | (1u64 << KCGEVENT_LEFT_MOUSE_UP)
+            | (1u64 << KCGEVENT_RIGHT_MOUSE_DOWN)
+            | (1u64 << KCGEVENT_RIGHT_MOUSE_UP)
+            | (1u64 << KCGEVENT_OTHER_MOUSE_DOWN)
+            | (1u64 << KCGEVENT_OTHER_MOUSE_UP);
 
         let context = Box::new(TapContext {
             tx,
             mouse_state,
             capturing,
+            suppressing,
         });
         let context_ptr = Box::into_raw(context) as *mut c_void;
 
         let tap = CGEventTapCreate(
             KCGHID_EVENT_TAP,
             KCGHEAD_INSERT_EVENT_TAP,
-            KCGEVENT_TAP_OPTION_LISTEN_ONLY,
+            KCGEVENT_TAP_OPTION_DEFAULT,
             mask,
             tap_callback,
             context_ptr,
