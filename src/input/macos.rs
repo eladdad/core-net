@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGMouseButton};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
-use std::os::raw::{c_int, c_longlong, c_uint, c_ulonglong, c_void};
+use std::os::raw::{c_char, c_int, c_longlong, c_uint, c_ulonglong, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -33,6 +33,7 @@ pub struct MacOSInputCapture {
 }
 
 static CURSOR_HIDE_PASSES: AtomicU32 = AtomicU32::new(0);
+static APPKIT_HIDE_PASSES: AtomicU32 = AtomicU32::new(0);
 
 impl MacOSInputCapture {
     pub fn new() -> Self {
@@ -375,11 +376,15 @@ fn set_cursor_suppression(suppress: bool) {
             }
 
             CURSOR_HIDE_PASSES.store(hide_passes, Ordering::SeqCst);
+            let appkit_hide_ok = appkit_cursor_set_hidden(true, 1);
+            let appkit_hide_passes = if appkit_hide_ok { 1 } else { 0 };
+            APPKIT_HIDE_PASSES.store(appkit_hide_passes, Ordering::SeqCst);
             let visible_after = CGCursorIsVisible();
             tracing::info!(
                 assoc_rc = assoc_rc,
                 hide_results = ?hide_results,
                 hide_passes = hide_passes,
+                appkit_hide_ok = appkit_hide_ok,
                 main_display = main_display_id,
                 cursor_display = ?cursor_display,
                 target_displays = ?target_displays,
@@ -397,11 +402,15 @@ fn set_cursor_suppression(suppress: bool) {
                     show_results.push((*display, CGDisplayShowCursor(*display)));
                 }
             }
+            let appkit_hide_passes = APPKIT_HIDE_PASSES.swap(0, Ordering::SeqCst);
+            let appkit_show_ok = appkit_cursor_set_hidden(false, appkit_hide_passes);
             let visible_after = CGCursorIsVisible();
             tracing::info!(
                 assoc_rc = assoc_rc,
                 show_results = ?show_results,
                 show_passes = hide_passes,
+                appkit_show_ok = appkit_show_ok,
+                appkit_show_passes = appkit_hide_passes,
                 main_display = main_display_id,
                 cursor_display = ?cursor_display,
                 target_displays = ?target_displays,
@@ -410,6 +419,71 @@ fn set_cursor_suppression(suppress: bool) {
                 cursor_y = y,
                 "cursor suppress OFF"
             );
+        }
+    }
+}
+
+fn appkit_cursor_set_hidden(hidden: bool, passes: u32) -> bool {
+    unsafe {
+        type ObjcId = *mut c_void;
+        type Sel = *mut c_void;
+
+        #[link(name = "AppKit", kind = "framework")]
+        extern "C" {
+            fn NSApplicationLoad() -> bool;
+        }
+
+        #[link(name = "objc")]
+        extern "C" {
+            fn objc_getClass(name: *const c_char) -> ObjcId;
+            fn sel_registerName(name: *const c_char) -> Sel;
+            fn objc_msgSend();
+        }
+
+        if !NSApplicationLoad() {
+            tracing::debug!("NSApplicationLoad failed");
+            return false;
+        }
+
+        let ns_cursor_class = objc_getClass(b"NSCursor\0".as_ptr() as *const c_char);
+        if ns_cursor_class.is_null() {
+            tracing::debug!("objc_getClass(NSCursor) failed");
+            return false;
+        }
+
+        let sel_set_hidden_until_mouse_moves =
+            sel_registerName(b"setHiddenUntilMouseMoves:\0".as_ptr() as *const c_char);
+        if sel_set_hidden_until_mouse_moves.is_null() {
+            tracing::debug!("sel_registerName(setHiddenUntilMouseMoves:) failed");
+            return false;
+        }
+
+        let msg_send_bool: extern "C" fn(ObjcId, Sel, bool) =
+            std::mem::transmute(objc_msgSend as *const ());
+        msg_send_bool(ns_cursor_class, sel_set_hidden_until_mouse_moves, hidden);
+
+        if hidden {
+            let sel_hide = sel_registerName(b"hide\0".as_ptr() as *const c_char);
+            if sel_hide.is_null() {
+                tracing::debug!("sel_registerName(hide) failed");
+                return false;
+            }
+            let msg_send_void: extern "C" fn(ObjcId, Sel) =
+                std::mem::transmute(objc_msgSend as *const ());
+            msg_send_void(ns_cursor_class, sel_hide);
+            true
+        } else {
+            let sel_unhide = sel_registerName(b"unhide\0".as_ptr() as *const c_char);
+            if sel_unhide.is_null() {
+                tracing::debug!("sel_registerName(unhide) failed");
+                return false;
+            }
+            let msg_send_void: extern "C" fn(ObjcId, Sel) =
+                std::mem::transmute(objc_msgSend as *const ());
+            for _ in 0..passes {
+                msg_send_void(ns_cursor_class, sel_unhide);
+            }
+            true
         }
     }
 }
