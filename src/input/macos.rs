@@ -34,6 +34,14 @@ pub struct MacOSInputCapture {
 
 static CURSOR_HIDE_PASSES: AtomicU32 = AtomicU32::new(0);
 static APPKIT_HIDE_PASSES: AtomicU32 = AtomicU32::new(0);
+static PREVIOUS_FRONT_PROCESS: Mutex<Option<ProcessSerialNumber>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+struct ProcessSerialNumber {
+    high_long_of_psn: u32,
+    low_long_of_psn: u32,
+}
 
 impl MacOSInputCapture {
     pub fn new() -> Self {
@@ -361,6 +369,8 @@ fn set_cursor_suppression(suppress: bool) {
 
         if suppress {
             const MAX_HIDE_PASSES: u32 = 32;
+            let (fg_get_current_rc, fg_get_front_rc, fg_transform_rc, fg_set_front_rc) =
+                push_self_to_front_for_cursor_control();
             let assoc_rc = CGAssociateMouseAndMouseCursorPosition(false);
             let mut hide_results = Vec::new();
             let mut hide_passes = 0u32;
@@ -385,6 +395,10 @@ fn set_cursor_suppression(suppress: bool) {
                 hide_results = ?hide_results,
                 hide_passes = hide_passes,
                 appkit_hide_ok = appkit_hide_ok,
+                fg_get_current_rc = fg_get_current_rc,
+                fg_get_front_rc = fg_get_front_rc,
+                fg_transform_rc = fg_transform_rc,
+                fg_set_front_rc = fg_set_front_rc,
                 main_display = main_display_id,
                 cursor_display = ?cursor_display,
                 target_displays = ?target_displays,
@@ -404,6 +418,7 @@ fn set_cursor_suppression(suppress: bool) {
             }
             let appkit_hide_passes = APPKIT_HIDE_PASSES.swap(0, Ordering::SeqCst);
             let appkit_show_ok = appkit_cursor_set_hidden(false, appkit_hide_passes);
+            let restore_front_rc = restore_previous_front_process();
             let visible_after = CGCursorIsVisible();
             tracing::info!(
                 assoc_rc = assoc_rc,
@@ -411,6 +426,7 @@ fn set_cursor_suppression(suppress: bool) {
                 show_passes = hide_passes,
                 appkit_show_ok = appkit_show_ok,
                 appkit_show_passes = appkit_hide_passes,
+                restore_front_rc = restore_front_rc,
                 main_display = main_display_id,
                 cursor_display = ?cursor_display,
                 target_displays = ?target_displays,
@@ -419,6 +435,63 @@ fn set_cursor_suppression(suppress: bool) {
                 cursor_y = y,
                 "cursor suppress OFF"
             );
+        }
+    }
+}
+
+fn push_self_to_front_for_cursor_control() -> (i32, i32, i32, i32) {
+    unsafe {
+        #[link(name = "Carbon", kind = "framework")]
+        extern "C" {
+            fn GetCurrentProcess(psn: *mut ProcessSerialNumber) -> i32;
+            fn GetFrontProcess(psn: *mut ProcessSerialNumber) -> i32;
+            fn TransformProcessType(psn: *mut ProcessSerialNumber, transform_state: u32) -> i32;
+            fn SetFrontProcess(psn: *const ProcessSerialNumber) -> i32;
+        }
+
+        const KPROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION: u32 = 1;
+
+        let mut current = ProcessSerialNumber {
+            high_long_of_psn: 0,
+            low_long_of_psn: 0,
+        };
+        let mut front = ProcessSerialNumber {
+            high_long_of_psn: 0,
+            low_long_of_psn: 0,
+        };
+
+        let get_current_rc = GetCurrentProcess(&mut current);
+        let get_front_rc = GetFrontProcess(&mut front);
+        if get_current_rc == 0 && get_front_rc == 0 && front != current {
+            if let Ok(mut prev) = PREVIOUS_FRONT_PROCESS.lock() {
+                *prev = Some(front);
+            }
+        }
+
+        let transform_rc =
+            TransformProcessType(&mut current, KPROCESS_TRANSFORM_TO_FOREGROUND_APPLICATION);
+        let set_front_rc = SetFrontProcess(&current);
+        (get_current_rc, get_front_rc, transform_rc, set_front_rc)
+    }
+}
+
+fn restore_previous_front_process() -> i32 {
+    unsafe {
+        #[link(name = "Carbon", kind = "framework")]
+        extern "C" {
+            fn SetFrontProcess(psn: *const ProcessSerialNumber) -> i32;
+        }
+
+        let previous = if let Ok(mut prev) = PREVIOUS_FRONT_PROCESS.lock() {
+            prev.take()
+        } else {
+            None
+        };
+
+        if let Some(front) = previous {
+            SetFrontProcess(&front)
+        } else {
+            0
         }
     }
 }
