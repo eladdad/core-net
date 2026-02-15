@@ -17,7 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
-use super::events::{InputEvent, KeyboardState, MouseMoveEvent, MouseState};
+use super::events::{
+    InputEvent, KeyboardEvent, KeyboardState, MouseButtonEvent, MouseMoveEvent, MouseScrollEvent,
+    MouseState,
+};
 use super::traits::{InputCapture, InputError, InputInjector, InputResult};
 use crate::protocol::{Modifiers, MouseButton};
 
@@ -77,6 +80,7 @@ impl InputCapture for MacOSInputCapture {
         let (tx, rx) = mpsc::channel(1024);
         let capturing = self.capturing.clone();
         let mouse_state = self.mouse_state.clone();
+        let keyboard_state = self.keyboard_state.clone();
         let suppressing = self.suppressing.clone();
 
         capturing.store(true, Ordering::SeqCst);
@@ -84,7 +88,14 @@ impl InputCapture for MacOSInputCapture {
         std::thread::spawn(move || {
             let tap_tx = tx.clone();
             let tap_mouse_state = mouse_state.clone();
-            if !spawn_event_tap_loop(tap_tx, tap_mouse_state, capturing.clone(), suppressing.clone()) {
+            let tap_keyboard_state = keyboard_state.clone();
+            if !spawn_event_tap_loop(
+                tap_tx,
+                tap_mouse_state,
+                tap_keyboard_state,
+                capturing.clone(),
+                suppressing.clone(),
+            ) {
                 tracing::warn!("Event tap unavailable, falling back to polling mode");
                 polling_capture_loop(capturing, suppressing, mouse_state, tx);
             }
@@ -151,7 +162,7 @@ impl Drop for MacOSInputCapture {
 }
 
 /// macOS input injection implementation using CGEvent
-/// 
+///
 /// Note: We don't store CGEventSource because it's not Send+Sync.
 /// Instead, we create it on-demand for each operation.
 pub struct MacOSInputInjector {
@@ -530,8 +541,9 @@ fn polling_capture_loop(
 fn spawn_event_tap_loop(
     tx: mpsc::Sender<InputEvent>,
     mouse_state: Arc<Mutex<MouseState>>,
+    keyboard_state: Arc<Mutex<KeyboardState>>,
     capturing: Arc<AtomicBool>,
-    _suppressing: Arc<AtomicBool>,
+    suppressing: Arc<AtomicBool>,
 ) -> bool {
     unsafe {
         type CGEventTapProxy = *mut c_void;
@@ -548,7 +560,12 @@ fn spawn_event_tap_loop(
                 place: c_uint,
                 options: c_uint,
                 events_of_interest: CGEventMask,
-                callback: extern "C" fn(CGEventTapProxy, CGEventType, CGEventRef, *mut c_void) -> CGEventRef,
+                callback: extern "C" fn(
+                    CGEventTapProxy,
+                    CGEventType,
+                    CGEventRef,
+                    *mut c_void,
+                ) -> CGEventRef,
                 user_info: *mut c_void,
             ) -> CFMachPortRef;
             fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
@@ -557,32 +574,70 @@ fn spawn_event_tap_loop(
                 port: CFMachPortRef,
                 order: c_longlong,
             ) -> CFRunLoopSourceRef;
-            fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: *const c_void);
+            fn CFRunLoopAddSource(
+                rl: CFRunLoopRef,
+                source: CFRunLoopSourceRef,
+                mode: *const c_void,
+            );
             fn CFRunLoopRun();
             fn CFRunLoopStop(rl: CFRunLoopRef);
             fn CFRunLoopGetCurrent() -> CFRunLoopRef;
             fn CFRelease(obj: *const c_void);
+            fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+            fn CGEventGetFlags(event: CGEventRef) -> c_ulonglong;
             fn CGEventGetIntegerValueField(event: CGEventRef, field: c_int) -> c_longlong;
             static kCFRunLoopCommonModes: *const c_void;
         }
 
-        const KCGHID_EVENT_TAP: c_uint = 0;
+        const KCGSESSION_EVENT_TAP: c_uint = 1;
         const KCGHEAD_INSERT_EVENT_TAP: c_uint = 0;
-        const KCGEVENT_TAP_OPTION_LISTEN_ONLY: c_uint = 1;
+        const KCGEVENT_TAP_OPTION_DEFAULT: c_uint = 0;
 
+        const KCGEVENT_LEFT_MOUSE_DOWN: CGEventType = 1;
+        const KCGEVENT_LEFT_MOUSE_UP: CGEventType = 2;
+        const KCGEVENT_RIGHT_MOUSE_DOWN: CGEventType = 3;
+        const KCGEVENT_RIGHT_MOUSE_UP: CGEventType = 4;
         const KCGEVENT_MOUSE_MOVED: CGEventType = 5;
         const KCGEVENT_LEFT_MOUSE_DRAGGED: CGEventType = 6;
         const KCGEVENT_RIGHT_MOUSE_DRAGGED: CGEventType = 7;
+        const KCGEVENT_KEY_DOWN: CGEventType = 10;
+        const KCGEVENT_KEY_UP: CGEventType = 11;
+        const KCGEVENT_FLAGS_CHANGED: CGEventType = 12;
+        const KCGEVENT_SCROLL_WHEEL: CGEventType = 22;
+        const KCGEVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
+        const KCGEVENT_OTHER_MOUSE_UP: CGEventType = 26;
         const KCGEVENT_OTHER_MOUSE_DRAGGED: CGEventType = 27;
 
+        const KCGMOUSE_EVENT_BUTTON_NUMBER: c_int = 3;
         const KCGMOUSE_EVENT_DELTA_X: c_int = 4;
         const KCGMOUSE_EVENT_DELTA_Y: c_int = 5;
+        const KCGKEYBOARD_EVENT_KEYCODE: c_int = 9;
+        const KCGSCROLL_WHEEL_EVENT_DELTA_AXIS1: c_int = 11;
+        const KCGSCROLL_WHEEL_EVENT_DELTA_AXIS2: c_int = 12;
+
+        const KCG_EVENT_FLAG_MASK_ALPHA_SHIFT: u64 = 1 << 16;
+        const KCG_EVENT_FLAG_MASK_SHIFT: u64 = 1 << 17;
+        const KCG_EVENT_FLAG_MASK_CONTROL: u64 = 1 << 18;
+        const KCG_EVENT_FLAG_MASK_ALTERNATE: u64 = 1 << 19;
+        const KCG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
+
+        const MAC_KEYCODE_LEFT_SHIFT: u32 = 56;
+        const MAC_KEYCODE_RIGHT_SHIFT: u32 = 60;
+        const MAC_KEYCODE_LEFT_CONTROL: u32 = 59;
+        const MAC_KEYCODE_RIGHT_CONTROL: u32 = 62;
+        const MAC_KEYCODE_LEFT_OPTION: u32 = 58;
+        const MAC_KEYCODE_RIGHT_OPTION: u32 = 61;
+        const MAC_KEYCODE_LEFT_COMMAND: u32 = 55;
+        const MAC_KEYCODE_RIGHT_COMMAND: u32 = 54;
+        const MAC_KEYCODE_CAPS_LOCK: u32 = 57;
 
         #[repr(C)]
         struct TapContext {
             tx: mpsc::Sender<InputEvent>,
             mouse_state: Arc<Mutex<MouseState>>,
+            keyboard_state: Arc<Mutex<KeyboardState>>,
             capturing: Arc<AtomicBool>,
+            suppressing: Arc<AtomicBool>,
         }
 
         extern "C" fn tap_callback(
@@ -598,6 +653,9 @@ fn spawn_event_tap_loop(
                     return event;
                 }
 
+                let suppress_local = context.suppressing.load(Ordering::SeqCst);
+                let mut swallow_event = false;
+
                 if event_type == KCGEVENT_MOUSE_MOVED
                     || event_type == KCGEVENT_LEFT_MOUSE_DRAGGED
                     || event_type == KCGEVENT_RIGHT_MOUSE_DRAGGED
@@ -607,13 +665,12 @@ fn spawn_event_tap_loop(
                     let dy = CGEventGetIntegerValueField(event, KCGMOUSE_EVENT_DELTA_Y) as i32;
 
                     if dx != 0 || dy != 0 {
-                        let (x, y) = get_cursor_position();
-                        let timestamp = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_micros() as u64;
+                        let location = CGEventGetLocation(event);
+                        let x = location.x as i32;
+                        let y = location.y as i32;
+                        let timestamp = event_timestamp_micros();
 
-                        let event = InputEvent::MouseMove(MouseMoveEvent {
+                        let move_event = InputEvent::MouseMove(MouseMoveEvent {
                             timestamp,
                             x: Some(x),
                             y: Some(y),
@@ -626,30 +683,167 @@ fn spawn_event_tap_loop(
                             state.y = y;
                         }
 
-                        let _ = context.tx.blocking_send(event);
+                        let _ = context.tx.blocking_send(move_event);
                     }
+                    swallow_event = suppress_local;
+                } else if event_type == KCGEVENT_LEFT_MOUSE_DOWN
+                    || event_type == KCGEVENT_LEFT_MOUSE_UP
+                    || event_type == KCGEVENT_RIGHT_MOUSE_DOWN
+                    || event_type == KCGEVENT_RIGHT_MOUSE_UP
+                    || event_type == KCGEVENT_OTHER_MOUSE_DOWN
+                    || event_type == KCGEVENT_OTHER_MOUSE_UP
+                {
+                    let button_number =
+                        CGEventGetIntegerValueField(event, KCGMOUSE_EVENT_BUTTON_NUMBER) as i32;
+                    if let Some(button) = mouse_button_for_event(event_type, button_number) {
+                        let pressed = event_type == KCGEVENT_LEFT_MOUSE_DOWN
+                            || event_type == KCGEVENT_RIGHT_MOUSE_DOWN
+                            || event_type == KCGEVENT_OTHER_MOUSE_DOWN;
+                        let location = CGEventGetLocation(event);
+                        let x = location.x as i32;
+                        let y = location.y as i32;
+                        let timestamp = event_timestamp_micros();
+
+                        if let Ok(mut state) = context.mouse_state.lock() {
+                            state.x = x;
+                            state.y = y;
+                            state.set_button(button, pressed);
+                        }
+
+                        let button_event = InputEvent::MouseButton(MouseButtonEvent {
+                            timestamp,
+                            button,
+                            pressed,
+                            x,
+                            y,
+                        });
+                        let _ = context.tx.blocking_send(button_event);
+                    }
+                    swallow_event = suppress_local;
+                } else if event_type == KCGEVENT_SCROLL_WHEEL {
+                    let dy = CGEventGetIntegerValueField(event, KCGSCROLL_WHEEL_EVENT_DELTA_AXIS1)
+                        as i32;
+                    let dx = CGEventGetIntegerValueField(event, KCGSCROLL_WHEEL_EVENT_DELTA_AXIS2)
+                        as i32;
+                    if dx != 0 || dy != 0 {
+                        let timestamp = event_timestamp_micros();
+                        let scroll_event =
+                            InputEvent::MouseScroll(MouseScrollEvent { timestamp, dx, dy });
+                        let _ = context.tx.blocking_send(scroll_event);
+                    }
+                    swallow_event = suppress_local;
+                } else if event_type == KCGEVENT_KEY_DOWN || event_type == KCGEVENT_KEY_UP {
+                    let mac_keycode =
+                        CGEventGetIntegerValueField(event, KCGKEYBOARD_EVENT_KEYCODE) as u32;
+                    let keycode = macos_keycode_to_hid(mac_keycode);
+                    let flags = CGEventGetFlags(event) as u64;
+                    let modifiers = modifiers_from_cg_flags(flags);
+                    let pressed = event_type == KCGEVENT_KEY_DOWN;
+                    let timestamp = event_timestamp_micros();
+
+                    if let Ok(mut state) = context.keyboard_state.lock() {
+                        state.modifiers = modifiers;
+                        if pressed {
+                            state.key_down(keycode);
+                        } else {
+                            state.key_up(keycode);
+                        }
+                    }
+
+                    let key_event = InputEvent::Keyboard(KeyboardEvent {
+                        timestamp,
+                        keycode,
+                        scancode: mac_keycode,
+                        pressed,
+                        character: None,
+                        modifiers,
+                    });
+                    let _ = context.tx.blocking_send(key_event);
+                    swallow_event = suppress_local;
+                } else if event_type == KCGEVENT_FLAGS_CHANGED {
+                    let mac_keycode =
+                        CGEventGetIntegerValueField(event, KCGKEYBOARD_EVENT_KEYCODE) as u32;
+                    let flags = CGEventGetFlags(event) as u64;
+                    let modifiers = modifiers_from_cg_flags(flags);
+                    if let Some(pressed) = match mac_keycode {
+                        MAC_KEYCODE_LEFT_SHIFT | MAC_KEYCODE_RIGHT_SHIFT => {
+                            Some((flags & KCG_EVENT_FLAG_MASK_SHIFT) != 0)
+                        }
+                        MAC_KEYCODE_LEFT_CONTROL | MAC_KEYCODE_RIGHT_CONTROL => {
+                            Some((flags & KCG_EVENT_FLAG_MASK_CONTROL) != 0)
+                        }
+                        MAC_KEYCODE_LEFT_OPTION | MAC_KEYCODE_RIGHT_OPTION => {
+                            Some((flags & KCG_EVENT_FLAG_MASK_ALTERNATE) != 0)
+                        }
+                        MAC_KEYCODE_LEFT_COMMAND | MAC_KEYCODE_RIGHT_COMMAND => {
+                            Some((flags & KCG_EVENT_FLAG_MASK_COMMAND) != 0)
+                        }
+                        MAC_KEYCODE_CAPS_LOCK => {
+                            Some((flags & KCG_EVENT_FLAG_MASK_ALPHA_SHIFT) != 0)
+                        }
+                        _ => None,
+                    } {
+                        let keycode = macos_keycode_to_hid(mac_keycode);
+                        let timestamp = event_timestamp_micros();
+
+                        if let Ok(mut state) = context.keyboard_state.lock() {
+                            state.modifiers = modifiers;
+                            if pressed {
+                                state.key_down(keycode);
+                            } else {
+                                state.key_up(keycode);
+                            }
+                        }
+
+                        let key_event = InputEvent::Keyboard(KeyboardEvent {
+                            timestamp,
+                            keycode,
+                            scancode: mac_keycode,
+                            pressed,
+                            character: None,
+                            modifiers,
+                        });
+                        let _ = context.tx.blocking_send(key_event);
+                    }
+                    swallow_event = suppress_local;
                 }
 
-                event
+                if swallow_event {
+                    std::ptr::null_mut()
+                } else {
+                    event
+                }
             }
         }
 
-        let mask = (1u64 << KCGEVENT_MOUSE_MOVED)
+        let mask = (1u64 << KCGEVENT_LEFT_MOUSE_DOWN)
+            | (1u64 << KCGEVENT_LEFT_MOUSE_UP)
+            | (1u64 << KCGEVENT_RIGHT_MOUSE_DOWN)
+            | (1u64 << KCGEVENT_RIGHT_MOUSE_UP)
+            | (1u64 << KCGEVENT_MOUSE_MOVED)
             | (1u64 << KCGEVENT_LEFT_MOUSE_DRAGGED)
             | (1u64 << KCGEVENT_RIGHT_MOUSE_DRAGGED)
+            | (1u64 << KCGEVENT_KEY_DOWN)
+            | (1u64 << KCGEVENT_KEY_UP)
+            | (1u64 << KCGEVENT_FLAGS_CHANGED)
+            | (1u64 << KCGEVENT_SCROLL_WHEEL)
+            | (1u64 << KCGEVENT_OTHER_MOUSE_DOWN)
+            | (1u64 << KCGEVENT_OTHER_MOUSE_UP)
             | (1u64 << KCGEVENT_OTHER_MOUSE_DRAGGED);
 
         let context = Box::new(TapContext {
             tx,
             mouse_state,
+            keyboard_state,
             capturing,
+            suppressing,
         });
         let context_ptr = Box::into_raw(context) as *mut c_void;
 
         let tap = CGEventTapCreate(
-            KCGHID_EVENT_TAP,
+            KCGSESSION_EVENT_TAP,
             KCGHEAD_INSERT_EVENT_TAP,
-            KCGEVENT_TAP_OPTION_LISTEN_ONLY,
+            KCGEVENT_TAP_OPTION_DEFAULT,
             mask,
             tap_callback,
             context_ptr,
@@ -722,71 +916,127 @@ fn set_modifier_flags(event: &CGEvent, modifiers: &Modifiers) {
     event.set_flags(flags);
 }
 
+fn event_timestamp_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+}
+
+fn modifiers_from_cg_flags(flags: u64) -> Modifiers {
+    const KCG_EVENT_FLAG_MASK_ALPHA_SHIFT: u64 = 1 << 16;
+    const KCG_EVENT_FLAG_MASK_SHIFT: u64 = 1 << 17;
+    const KCG_EVENT_FLAG_MASK_CONTROL: u64 = 1 << 18;
+    const KCG_EVENT_FLAG_MASK_ALTERNATE: u64 = 1 << 19;
+    const KCG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
+    const KCG_EVENT_FLAG_MASK_NUMERIC_PAD: u64 = 1 << 21;
+
+    Modifiers {
+        shift: (flags & KCG_EVENT_FLAG_MASK_SHIFT) != 0,
+        ctrl: (flags & KCG_EVENT_FLAG_MASK_CONTROL) != 0,
+        alt: (flags & KCG_EVENT_FLAG_MASK_ALTERNATE) != 0,
+        meta: (flags & KCG_EVENT_FLAG_MASK_COMMAND) != 0,
+        caps_lock: (flags & KCG_EVENT_FLAG_MASK_ALPHA_SHIFT) != 0,
+        num_lock: (flags & KCG_EVENT_FLAG_MASK_NUMERIC_PAD) != 0,
+    }
+}
+
+fn mouse_button_for_event(event_type: c_uint, button_number: i32) -> Option<MouseButton> {
+    const KCGEVENT_LEFT_MOUSE_DOWN: c_uint = 1;
+    const KCGEVENT_LEFT_MOUSE_UP: c_uint = 2;
+    const KCGEVENT_RIGHT_MOUSE_DOWN: c_uint = 3;
+    const KCGEVENT_RIGHT_MOUSE_UP: c_uint = 4;
+    const KCGEVENT_OTHER_MOUSE_DOWN: c_uint = 25;
+    const KCGEVENT_OTHER_MOUSE_UP: c_uint = 26;
+
+    match event_type {
+        KCGEVENT_LEFT_MOUSE_DOWN | KCGEVENT_LEFT_MOUSE_UP => Some(MouseButton::Left),
+        KCGEVENT_RIGHT_MOUSE_DOWN | KCGEVENT_RIGHT_MOUSE_UP => Some(MouseButton::Right),
+        KCGEVENT_OTHER_MOUSE_DOWN | KCGEVENT_OTHER_MOUSE_UP => match button_number {
+            2 => Some(MouseButton::Middle),
+            3 => Some(MouseButton::Button4),
+            4 => Some(MouseButton::Button5),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+const HID_TO_MAC_KEYCODE: &[(u32, u32)] = &[
+    (0x04, 0),   // A
+    (0x05, 11),  // B
+    (0x06, 8),   // C
+    (0x07, 2),   // D
+    (0x08, 14),  // E
+    (0x09, 3),   // F
+    (0x0A, 5),   // G
+    (0x0B, 4),   // H
+    (0x0C, 34),  // I
+    (0x0D, 38),  // J
+    (0x0E, 40),  // K
+    (0x0F, 37),  // L
+    (0x10, 46),  // M
+    (0x11, 45),  // N
+    (0x12, 31),  // O
+    (0x13, 35),  // P
+    (0x14, 12),  // Q
+    (0x15, 15),  // R
+    (0x16, 1),   // S
+    (0x17, 17),  // T
+    (0x18, 32),  // U
+    (0x19, 9),   // V
+    (0x1A, 13),  // W
+    (0x1B, 7),   // X
+    (0x1C, 16),  // Y
+    (0x1D, 6),   // Z
+    (0x1E, 18),  // 1
+    (0x1F, 19),  // 2
+    (0x20, 20),  // 3
+    (0x21, 21),  // 4
+    (0x22, 23),  // 5
+    (0x23, 22),  // 6
+    (0x24, 26),  // 7
+    (0x25, 28),  // 8
+    (0x26, 25),  // 9
+    (0x27, 29),  // 0
+    (0x28, 36),  // Return
+    (0x29, 53),  // Escape
+    (0x2A, 51),  // Backspace
+    (0x2B, 48),  // Tab
+    (0x2C, 49),  // Space
+    (0x4F, 124), // Right Arrow
+    (0x50, 123), // Left Arrow
+    (0x51, 125), // Down Arrow
+    (0x52, 126), // Up Arrow
+    (0xE0, 59),  // Left Control
+    (0xE1, 56),  // Left Shift
+    (0xE2, 58),  // Left Option
+    (0xE3, 55),  // Left Command
+    (0xE4, 62),  // Right Control
+    (0xE5, 60),  // Right Shift
+    (0xE6, 61),  // Right Option
+    (0xE7, 54),  // Right Command
+];
+
 /// Convert USB HID keycode to macOS virtual keycode
 fn hid_to_macos_keycode(hid: u32) -> u32 {
-    static HID_TO_MAC: &[(u32, u32)] = &[
-        (0x04, 0),   // A
-        (0x05, 11),  // B
-        (0x06, 8),   // C
-        (0x07, 2),   // D
-        (0x08, 14),  // E
-        (0x09, 3),   // F
-        (0x0A, 5),   // G
-        (0x0B, 4),   // H
-        (0x0C, 34),  // I
-        (0x0D, 38),  // J
-        (0x0E, 40),  // K
-        (0x0F, 37),  // L
-        (0x10, 46),  // M
-        (0x11, 45),  // N
-        (0x12, 31),  // O
-        (0x13, 35),  // P
-        (0x14, 12),  // Q
-        (0x15, 15),  // R
-        (0x16, 1),   // S
-        (0x17, 17),  // T
-        (0x18, 32),  // U
-        (0x19, 9),   // V
-        (0x1A, 13),  // W
-        (0x1B, 7),   // X
-        (0x1C, 16),  // Y
-        (0x1D, 6),   // Z
-        (0x1E, 18),  // 1
-        (0x1F, 19),  // 2
-        (0x20, 20),  // 3
-        (0x21, 21),  // 4
-        (0x22, 23),  // 5
-        (0x23, 22),  // 6
-        (0x24, 26),  // 7
-        (0x25, 28),  // 8
-        (0x26, 25),  // 9
-        (0x27, 29),  // 0
-        (0x28, 36),  // Return
-        (0x29, 53),  // Escape
-        (0x2A, 51),  // Backspace
-        (0x2B, 48),  // Tab
-        (0x2C, 49),  // Space
-        (0x4F, 124), // Right Arrow
-        (0x50, 123), // Left Arrow
-        (0x51, 125), // Down Arrow
-        (0x52, 126), // Up Arrow
-        (0xE0, 59),  // Left Control
-        (0xE1, 56),  // Left Shift
-        (0xE2, 58),  // Left Option
-        (0xE3, 55),  // Left Command
-        (0xE4, 62),  // Right Control
-        (0xE5, 60),  // Right Shift
-        (0xE6, 61),  // Right Option
-        (0xE7, 54),  // Right Command
-    ];
-
-    for &(h, m) in HID_TO_MAC {
+    for &(h, m) in HID_TO_MAC_KEYCODE {
         if h == hid {
             return m;
         }
     }
 
     hid
+}
+
+/// Convert macOS virtual keycode to USB HID keycode
+fn macos_keycode_to_hid(mac_keycode: u32) -> u32 {
+    for &(hid, mac) in HID_TO_MAC_KEYCODE {
+        if mac == mac_keycode {
+            return hid;
+        }
+    }
+    mac_keycode
 }
 
 /// Map a character to HID keycode and shift state
