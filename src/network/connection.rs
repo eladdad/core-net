@@ -101,6 +101,10 @@ pub struct ConnectionStats {
 impl Connection {
     /// Create a new connection from an established TCP stream
     pub fn new(stream: TcpStream, remote_addr: SocketAddr) -> Self {
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::warn!("Failed to enable TCP_NODELAY on {}: {}", remote_addr, e);
+        }
+
         Self {
             remote_addr,
             stream,

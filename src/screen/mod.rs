@@ -16,10 +16,36 @@ use crate::protocol::ScreenEdge;
 /// Get the screen dimensions for the current platform
 #[cfg(target_os = "macos")]
 pub fn get_screen_dimensions() -> (u32, u32) {
-    // In real implementation:
-    // CGDisplayPixelsWide(CGMainDisplayID())
-    // CGDisplayPixelsHigh(CGMainDisplayID())
-    (2560, 1600) // Default for Retina MacBook Pro
+    unsafe {
+        extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayBounds(display: u32) -> CGRect;
+        }
+
+        #[repr(C)]
+        struct CGPoint {
+            x: f64,
+            y: f64,
+        }
+
+        #[repr(C)]
+        struct CGSize {
+            width: f64,
+            height: f64,
+        }
+
+        #[repr(C)]
+        struct CGRect {
+            origin: CGPoint,
+            size: CGSize,
+        }
+
+        let display = CGMainDisplayID();
+        let bounds = CGDisplayBounds(display);
+        let w = bounds.size.width as u32;
+        let h = bounds.size.height as u32;
+        (w.max(1), h.max(1))
+    }
 }
 
 #[cfg(target_os = "windows")]

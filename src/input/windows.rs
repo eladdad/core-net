@@ -605,7 +605,7 @@ impl InputInjector for WindowsInputInjector {
                     dx,
                     dy,
                     mouseData: 0,
-                    dwFlags: MOUSEEVENTF_MOVE,
+                    dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE,
                     time: 0,
                     dwExtraInfo: 0,
                 },
