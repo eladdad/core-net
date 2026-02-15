@@ -338,37 +338,87 @@ fn set_cursor_suppression(suppress: bool) {
             fn CGDisplayHideCursor(display: u32) -> i32;
             fn CGDisplayShowCursor(display: u32) -> i32;
             fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+            fn CGCursorIsVisible() -> bool;
         }
 
         let (x, y) = get_cursor_position();
         let main_display_id = CGMainDisplayID();
         let cursor_display = display_for_cursor_point(x, y);
+        let mut target_displays = active_display_ids();
+        if target_displays.is_empty() {
+            target_displays.push(main_display_id);
+            if let Some(display) = cursor_display {
+                if display != main_display_id {
+                    target_displays.push(display);
+                }
+            }
+        }
+        target_displays.sort_unstable();
+        target_displays.dedup();
 
         if suppress {
             let assoc_rc = CGAssociateMouseAndMouseCursorPosition(false);
-            let hide_rc = CGDisplayHideCursor(main_display_id);
+            let mut hide_results = Vec::with_capacity(target_displays.len());
+            for display in &target_displays {
+                hide_results.push((*display, CGDisplayHideCursor(*display)));
+            }
+            let visible_after = CGCursorIsVisible();
             tracing::info!(
                 assoc_rc = assoc_rc,
-                hide_rc = hide_rc,
+                hide_results = ?hide_results,
                 main_display = main_display_id,
                 cursor_display = ?cursor_display,
+                target_displays = ?target_displays,
+                cursor_visible_after = visible_after,
                 cursor_x = x,
                 cursor_y = y,
                 "cursor suppress ON"
             );
         } else {
             let assoc_rc = CGAssociateMouseAndMouseCursorPosition(true);
-            let show_rc = CGDisplayShowCursor(main_display_id);
+            let mut show_results = Vec::with_capacity(target_displays.len());
+            for display in &target_displays {
+                show_results.push((*display, CGDisplayShowCursor(*display)));
+            }
+            let visible_after = CGCursorIsVisible();
             tracing::info!(
                 assoc_rc = assoc_rc,
-                show_rc = show_rc,
+                show_results = ?show_results,
                 main_display = main_display_id,
                 cursor_display = ?cursor_display,
+                target_displays = ?target_displays,
+                cursor_visible_after = visible_after,
                 cursor_x = x,
                 cursor_y = y,
                 "cursor suppress OFF"
             );
         }
+    }
+}
+
+fn active_display_ids() -> Vec<u32> {
+    unsafe {
+        extern "C" {
+            fn CGGetActiveDisplayList(
+                max_displays: u32,
+                active_displays: *mut u32,
+                display_count: *mut u32,
+            ) -> i32;
+        }
+
+        const MAX_DISPLAYS: usize = 16;
+        let mut displays = [0u32; MAX_DISPLAYS];
+        let mut display_count = 0u32;
+        let rc = CGGetActiveDisplayList(
+            MAX_DISPLAYS as u32,
+            displays.as_mut_ptr(),
+            &mut display_count,
+        );
+        if rc != 0 || display_count == 0 {
+            return Vec::new();
+        }
+
+        displays[..display_count.min(MAX_DISPLAYS as u32) as usize].to_vec()
     }
 }
 
