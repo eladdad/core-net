@@ -13,7 +13,7 @@ use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGEventTyp
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use std::os::raw::{c_int, c_longlong, c_uint, c_ulonglong, c_void};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -31,6 +31,8 @@ pub struct MacOSInputCapture {
     mouse_state: Arc<Mutex<MouseState>>,
     keyboard_state: Arc<Mutex<KeyboardState>>,
 }
+
+static CURSOR_HIDE_PASSES: AtomicU32 = AtomicU32::new(0);
 
 impl MacOSInputCapture {
     pub fn new() -> Self {
@@ -357,15 +359,27 @@ fn set_cursor_suppression(suppress: bool) {
         target_displays.dedup();
 
         if suppress {
+            const MAX_HIDE_PASSES: u32 = 32;
             let assoc_rc = CGAssociateMouseAndMouseCursorPosition(false);
-            let mut hide_results = Vec::with_capacity(target_displays.len());
-            for display in &target_displays {
-                hide_results.push((*display, CGDisplayHideCursor(*display)));
+            let mut hide_results = Vec::new();
+            let mut hide_passes = 0u32;
+
+            for _ in 0..MAX_HIDE_PASSES {
+                hide_passes += 1;
+                for display in &target_displays {
+                    hide_results.push((*display, CGDisplayHideCursor(*display)));
+                }
+                if !CGCursorIsVisible() {
+                    break;
+                }
             }
+
+            CURSOR_HIDE_PASSES.store(hide_passes, Ordering::SeqCst);
             let visible_after = CGCursorIsVisible();
             tracing::info!(
                 assoc_rc = assoc_rc,
                 hide_results = ?hide_results,
+                hide_passes = hide_passes,
                 main_display = main_display_id,
                 cursor_display = ?cursor_display,
                 target_displays = ?target_displays,
@@ -376,14 +390,18 @@ fn set_cursor_suppression(suppress: bool) {
             );
         } else {
             let assoc_rc = CGAssociateMouseAndMouseCursorPosition(true);
-            let mut show_results = Vec::with_capacity(target_displays.len());
-            for display in &target_displays {
-                show_results.push((*display, CGDisplayShowCursor(*display)));
+            let hide_passes = CURSOR_HIDE_PASSES.swap(0, Ordering::SeqCst).max(1);
+            let mut show_results = Vec::new();
+            for _ in 0..hide_passes {
+                for display in &target_displays {
+                    show_results.push((*display, CGDisplayShowCursor(*display)));
+                }
             }
             let visible_after = CGCursorIsVisible();
             tracing::info!(
                 assoc_rc = assoc_rc,
                 show_results = ?show_results,
+                show_passes = hide_passes,
                 main_display = main_display_id,
                 cursor_display = ?cursor_display,
                 target_displays = ?target_displays,
